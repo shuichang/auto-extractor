@@ -1,0 +1,17 @@
+services:
+  archivemate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: archivemate
+    restart: unless-stopped
+    ports:
+      - "3088:3088"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./extracted:/app/extracted
+      - /mnt/nfs_shuichang:/mnt/nfs_shuichang
+    environment:
+      - TZ=Asia/Shanghai
+    network_mode: host

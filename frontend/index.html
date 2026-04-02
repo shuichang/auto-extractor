@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ArchiveMate - 智能解压服务</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #080d18; --sidebar: #0c1221; --card: rgba(15,23,42,0.85);
+      --border: rgba(99,102,241,0.18); --primary: #6366f1; --primary-h: #818cf8;
+      --success: #22c55e; --error: #ef4444; --warning: #f59e0b; --pending: #a855f7;
+      --text: #e2e8f0; --muted: #94a3b8; --dim: #64748b;
+    }
+    * { font-family: 'Inter', system-ui, sans-serif; box-sizing: border-box; }
+    body { background: var(--bg); color: var(--text); margin: 0; overflow-x: hidden; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 3px; }
+    .sidebar { background: var(--sidebar); border-right: 1px solid var(--border); width: 220px; flex-shrink: 0; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; backdrop-filter: blur(12px); }
+    .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .badge-success { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .badge-error { background: rgba(239,68,68,0.15); color: #f87171; }
+    .badge-warning { background: rgba(245,158,11,0.15); color: #fbbf24; animation: pulse 1.5s infinite; }
+    .badge-info { background: rgba(99,102,241,0.15); color: #818cf8; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; border: none; transition: all .15s; }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-h); }
+    .btn-danger { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+    .btn-danger:hover { background: rgba(239,68,68,0.25); }
+    .btn-ghost { background: rgba(255,255,255,0.05); color: var(--muted); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: rgba(255,255,255,0.08); color: var(--text); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .input { background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 13px; outline: none; transition: border-color .15s; width: 100%; }
+    .input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(99,102,241,0.15); }
+    .input::placeholder { color: var(--dim); }
+    .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-radius: 9px; cursor: pointer; font-size: 13.5px; color: var(--muted); transition: all .15s; margin: 2px 8px; }
+    .nav-item:hover { background: rgba(99,102,241,0.08); color: var(--text); }
+    .nav-item.active { background: rgba(99,102,241,0.15); color: var(--primary-h); }
+    .stat-card { transition: transform .2s; }
+    .stat-card:hover { transform: translateY(-2px); }
+    .glow-blue { box-shadow: 0 0 24px rgba(99,102,241,0.12); }
+    .glow-green { box-shadow: 0 0 24px rgba(34,197,94,0.1); }
+    .glow-red { box-shadow: 0 0 24px rgba(239,68,68,0.1); }
+    .glow-purple { box-shadow: 0 0 24px rgba(168,85,247,0.1); }
+    .table-wrap table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .table-wrap th { background: rgba(255,255,255,0.03); color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+    .table-wrap td { padding: 10px 14px; border-bottom: 1px solid rgba(99,102,241,0.07); color: var(--muted); }
+    .table-wrap tr:last-child td { border-bottom: none; }
+    .table-wrap tr:hover td { background: rgba(99,102,241,0.04); }
+    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); z-index: 100; display: flex; align-items: center; justify-content: center; }
+    .modal { background: #0f1a2e; border: 1px solid var(--border); border-radius: 16px; padding: 24px; min-width: 440px; max-width: 560px; width: 100%; }
+    .log-entry { font-family: 'Menlo','Monaco','Consolas',monospace; font-size: 12px; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+    .log-info { color: #93c5fd; }
+    .log-warning { color: #fcd34d; }
+    .log-error { color: #fca5a5; }
+    .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
+    .toast { padding: 12px 16px; border-radius: 10px; font-size: 13px; display: flex; align-items: center; gap: 10px; animation: slideUp .2s ease; box-shadow: 0 4px 24px rgba(0,0,0,0.4); }
+    .toast-success { background: #052e16; border: 1px solid rgba(34,197,94,0.3); color: #4ade80; }
+    .toast-error { background: #1f0505; border: 1px solid rgba(239,68,68,0.3); color: #f87171; }
+    .toast-info { background: #0c1a3a; border: 1px solid rgba(99,102,241,0.3); color: #818cf8; }
+    @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+    .ring-svg { transform: rotate(-90deg); }
+    .truncate-path { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    select.input option { background: #0f1a2e; }
+    .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: white; border-radius: 50%; animation: spin .6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div id="app" style="display:flex;min-height:100vh;">
+
+  <!-- Sidebar -->
+  <aside class="sidebar flex flex-col" style="position:fixed;top:0;left:0;height:100vh;z-index:50;overflow-y:auto;">
+    <div style="padding:20px 16px 12px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+        <div style="width:34px;height:34px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px;">📦</div>
+        <div>
+          <div style="font-weight:700;font-size:15px;color:#e2e8f0;">ArchiveMate</div>
+          <div style="font-size:10px;color:#6366f1;">v2.0</div>
+        </div>
+      </div>
+    </div>
+    <nav style="flex:1;padding:4px 0;">
+      <div v-for="item in navItems" :key="item.id"
+        :class="['nav-item', activeTab === item.id ? 'active' : '']"
+        @click="activeTab = item.id">
+        <span style="font-size:15px;">{{ item.icon }}</span>
+        <span>{{ item.name }}</span>
+      </div>
+    </nav>
+    <div style="padding:12px 16px 20px;border-top:1px solid var(--border);">
+      <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);">
+        <span style="width:7px;height:7px;border-radius:50%;background:#22c55e;animation:pulse 2s infinite;"></span>
+        <span>服务运行中</span>
+      </div>
+      <div style="margin-top:8px;font-size:11px;color:var(--dim);">处理中: {{ stats.processing_count || 0 }} 个</div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <div style="margin-left:220px;flex:1;min-height:100vh;">
+
+    <!-- Dashboard -->
+    <div v-if="activeTab==='dashboard'" style="padding:28px;">
+      <div style="margin-bottom:24px;">
+        <h1 style="font-size:22px;font-weight:700;color:#e2e8f0;">仪表盘</h1>
+        <p style="color:var(--dim);font-size:13px;margin-top:4px;">实时监控解压任务状态</p>
+      </div>
+
+      <!-- Stats -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px;">
+        <div class="card stat-card glow-blue" style="padding:20px;">
+          <div style="color:var(--dim);font-size:12px;margin-bottom:8px;">📊 总处理量</div>
+          <div style="font-size:32px;font-weight:800;color:#e2e8f0;">{{ stats.total_archives }}</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px;">个压缩包</div>
+        </div>
+        <div class="card stat-card glow-green" style="padding:20px;">
+          <div style="color:#4ade80;font-size:12px;margin-bottom:8px;">✅ 解压成功</div>
+          <div style="font-size:32px;font-weight:800;color:#4ade80;">{{ stats.success_count }}</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px;">今日 +{{ stats.today_success }}</div>
+        </div>
+        <div class="card stat-card glow-red" style="padding:20px;">
+          <div style="color:#f87171;font-size:12px;margin-bottom:8px;">❌ 解压失败</div>
+          <div style="font-size:32px;font-weight:800;color:#f87171;">{{ stats.failed_count }}</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px;">今日 +{{ stats.today_failed }}</div>
+        </div>
+        <div class="card stat-card glow-purple" style="padding:20px;">
+          <div style="color:#c084fc;font-size:12px;margin-bottom:8px;">⚙️ 处理中</div>
+          <div style="font-size:32px;font-weight:800;color:#c084fc;">{{ stats.processing_count }}</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px;">并发任务</div>
+        </div>
+      </div>
+
+      <!-- Success ring + recent tasks -->
+      <div style="display:grid;grid-template-columns:1fr 2fr;gap:16px;margin-bottom:24px;">
+        <div class="card" style="padding:24px;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+          <div style="font-size:13px;color:var(--dim);margin-bottom:16px;font-weight:600;">成功率</div>
+          <svg width="120" height="120" class="ring-svg">
+            <circle cx="60" cy="60" r="50" fill="none" stroke="rgba(99,102,241,0.1)" stroke-width="10"/>
+            <circle cx="60" cy="60" r="50" fill="none" stroke="url(#ringGrad)" stroke-width="10"
+              :stroke-dasharray="`${successRate * 3.14159} 314.159`" stroke-linecap="round"/>
+            <defs>
+              <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="#6366f1"/>
+                <stop offset="100%" stop-color="#22c55e"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          <div style="font-size:28px;font-weight:800;margin-top:-100px;color:#e2e8f0;">{{ successRate }}%</div>
+          <div style="margin-top:88px;font-size:12px;color:var(--dim);">{{ stats.success_count }}/{{ stats.total_archives }}</div>
+        </div>
+        <div class="card" style="padding:20px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+            <span style="font-size:14px;font-weight:600;">最近任务</span>
+            <button class="btn btn-ghost" style="font-size:12px;padding:4px 10px;" @click="loadDashboard">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>文件名</th><th>状态</th><th>大小</th><th>时间</th></tr></thead>
+              <tbody>
+                <tr v-for="h in recentHistory" :key="h.id">
+                  <td><span class="truncate-path" :title="h.original_path">{{ h.original_path.split('/').pop() }}</span></td>
+                  <td><span :class="['badge', statusBadge(h.status)]">{{ statusText(h.status) }}</span></td>
+                  <td>{{ fmtSize(h.file_size) }}</td>
+                  <td style="white-space:nowrap;">{{ h.created_at ? h.created_at.slice(0,16) : '-' }}</td>
+                </tr>
+                <tr v-if="!recentHistory.length"><td colspan="4" style="text-align:center;padding:24px;color:var(--dim);">暂无数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Watch dirs overview -->
+      <div class="card" style="padding:20px;">
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px;">监控目录状态</div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;">
+          <div v-for="d in watchDirs" :key="d.id" class="card" style="padding:12px 16px;min-width:200px;border-color:rgba(99,102,241,0.12);">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+              <span :style="{width:'7px',height:'7px',borderRadius:'50%',background:d.enabled?'#22c55e':'#475569',display:'inline-block'}"></span>
+              <span style="font-size:12px;font-weight:600;color:#e2e8f0;">{{ d.watch_path.split('/').pop() }}</span>
+            </div>
+            <div style="font-size:11px;color:var(--dim);">→ {{ d.output_path.split('/').pop() }}</div>
+          </div>
+          <div v-if="!watchDirs.length" style="color:var(--dim);font-size:13px;">尚未添加监控目录</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Watch Dirs -->
+    <div v-if="activeTab==='dirs'" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+        <div><h1 style="font-size:22px;font-weight:700;">监控目录</h1><p style="color:var(--dim);font-size:13px;margin-top:4px;">管理自动解压监控路径</p></div>
+        <button class="btn btn-primary" @click="showDirModal=true">＋ 添加目录</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <div v-for="d in watchDirs" :key="d.id" class="card" style="padding:18px 20px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <div style="flex:1;">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                <span :style="{width:'8px',height:'8px',borderRadius:'50%',background:d.enabled?'#22c55e':'#475569',display:'inline-block',flexShrink:0}"></span>
+                <span style="font-weight:600;color:#e2e8f0;font-size:14px;">{{ d.watch_path }}</span>
+              </div>
+              <div style="font-size:12px;color:var(--dim);padding-left:16px;">
+                输出路径: <span style="color:#818cf8;">{{ d.output_path }}</span>
+                <span v-if="d.auto_delete" style="margin-left:10px;" class="badge badge-warning">自动删除</span>
+              </div>
+              <div style="font-size:11px;color:var(--dim);padding-left:16px;margin-top:4px;">创建于 {{ d.created_at ? d.created_at.slice(0,16) : '' }}</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;">
+              <button class="btn btn-ghost" style="font-size:12px;padding:5px 12px;" @click="scanDir(d.id)" :disabled="scanningId===d.id">
+                <span v-if="scanningId===d.id" class="spinner"></span>
+                <span v-else>🔍</span> 扫描
+              </button>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" :checked="d.enabled" @change="toggleDir(d.id,$event.target.checked)" style="display:none;">
+                <div @click="toggleDir(d.id,!d.enabled)"
+                  :style="{width:'40px',height:'22px',borderRadius:'11px',background:d.enabled?'#6366f1':'#1e293b',border:'1px solid rgba(99,102,241,0.3)',position:'relative',transition:'background .2s',cursor:'pointer'}">
+                  <div :style="{position:'absolute',top:'2px',left:d.enabled?'20px':'2px',width:'16px',height:'16px',borderRadius:'50%',background:'white',transition:'left .2s'}"></div>
+                </div>
+              </label>
+              <button class="btn btn-danger" style="padding:5px 12px;font-size:12px;" @click="deleteDir(d.id)">删除</button>
+            </div>
+          </div>
+        </div>
+        <div v-if="!watchDirs.length" class="card" style="padding:48px;text-align:center;color:var(--dim);">
+          <div style="font-size:40px;margin-bottom:12px;">📁</div>
+          <div style="font-size:14px;">还没有监控目录</div>
+          <div style="font-size:12px;margin-top:6px;">添加目录后，新压缩包将自动解压</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- History -->
+    <div v-if="activeTab==='history'" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+        <div><h1 style="font-size:22px;font-weight:700;">解压历史</h1><p style="color:var(--dim);font-size:13px;margin-top:4px;">共 {{ historyTotal }} 条记录</p></div>
+        <button class="btn btn-danger" @click="confirmClearHistory" style="font-size:12px;">🗑 清空历史</button>
+      </div>
+      <!-- Filters -->
+      <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;">
+        <select v-model="historyFilter.status" @change="loadHistory(1)" class="input" style="width:120px;">
+          <option value="">全部状态</option>
+          <option value="success">成功</option>
+          <option value="failed">失败</option>
+          <option value="processing">处理中</option>
+          <option value="pending">等待中</option>
+        </select>
+        <input v-model="historyFilter.search" @input="debounceHistory" placeholder="搜索文件名..." class="input" style="width:220px;">
+        <button class="btn btn-ghost" @click="loadHistory(1)">🔍 搜索</button>
+      </div>
+      <div class="card table-wrap">
+        <table>
+          <thead><tr><th>文件名</th><th>状态</th><th>大小</th><th>解压大小</th><th>耗时</th><th>密码</th><th>时间</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="h in historyItems" :key="h.id" @click="toggleHistoryDetail(h.id)" style="cursor:pointer;">
+              <td>
+                <div class="truncate-path" :title="h.original_path">{{ h.original_path.split('/').pop() }}</div>
+                <div v-if="expandedHistory===h.id" style="margin-top:8px;font-size:11px;">
+                  <div style="color:var(--dim);">原始路径: <span style="color:#93c5fd;">{{ h.original_path }}</span></div>
+                  <div v-if="h.output_path" style="color:var(--dim);margin-top:2px;">输出路径: <span style="color:#4ade80;">{{ h.output_path }}</span></div>
+                  <div v-if="h.error_message" style="color:#fca5a5;margin-top:4px;word-break:break-all;">错误: {{ h.error_message }}</div>
+                </div>
+              </td>
+              <td><span :class="['badge', statusBadge(h.status)]">{{ statusText(h.status) }}</span></td>
+              <td>{{ fmtSize(h.file_size) }}</td>
+              <td>{{ h.extracted_size ? fmtSize(h.extracted_size) : '-' }}</td>
+              <td>{{ h.duration_seconds ? h.duration_seconds.toFixed(1)+'s' : '-' }}</td>
+              <td>
+                <span v-if="h.password_used" style="font-family:monospace;font-size:11px;" :title="h.password_used">
+                  {{ '●'.repeat(Math.min(h.password_used.length, 6)) }}
+                </span>
+                <span v-else style="color:var(--dim);">无</span>
+              </td>
+              <td style="white-space:nowrap;font-size:11px;">{{ h.created_at ? h.created_at.slice(0,16) : '-' }}</td>
+              <td @click.stop>
+                <div style="display:flex;gap:6px;">
+                  <button v-if="h.status==='failed'" class="btn btn-ghost" style="font-size:11px;padding:3px 8px;" @click="retryHistory(h.id)">重试</button>
+                  <button class="btn btn-danger" style="font-size:11px;padding:3px 8px;" @click="deleteHistoryItem(h.id)">删除</button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="!historyItems.length"><td colspan="8" style="text-align:center;padding:32px;color:var(--dim);">暂无记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <!-- Pagination -->
+      <div style="display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:14px;" v-if="historyTotal>0">
+        <span style="font-size:12px;color:var(--dim);">第 {{ historyPage }} / {{ historyTotalPages }} 页</span>
+        <button class="btn btn-ghost" style="padding:5px 12px;font-size:12px;" @click="loadHistory(historyPage-1)" :disabled="historyPage<=1">← 上一页</button>
+        <button class="btn btn-ghost" style="padding:5px 12px;font-size:12px;" @click="loadHistory(historyPage+1)" :disabled="historyPage>=historyTotalPages">下一页 →</button>
+      </div>
+    </div>
+
+    <!-- Passwords -->
+    <div v-if="activeTab==='passwords'" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+        <div><h1 style="font-size:22px;font-weight:700;">密码管理</h1><p style="color:var(--dim);font-size:13px;margin-top:4px;">{{ passwords.length }} 个密码，解压时自动遍历</p></div>
+      </div>
+      <!-- Add password -->
+      <div class="card" style="padding:18px 20px;margin-bottom:16px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:12px;color:#e2e8f0;">添加密码</div>
+        <div style="display:flex;gap:10px;">
+          <input v-model="newPwd.password" placeholder="输入密码" class="input" style="flex:1;" @keyup.enter="addPassword">
+          <input v-model="newPwd.tag" placeholder="标签（可选）" class="input" style="width:140px;">
+          <button class="btn btn-primary" @click="addPassword" :disabled="!newPwd.password">添加</button>
+        </div>
+      </div>
+      <!-- Bulk import -->
+      <div class="card" style="padding:18px 20px;margin-bottom:16px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:#e2e8f0;">批量导入</div>
+        <textarea v-model="bulkPwds" placeholder="每行一个密码..." class="input" style="height:80px;resize:vertical;font-family:monospace;font-size:12px;"></textarea>
+        <button class="btn btn-primary" style="margin-top:8px;" @click="importPasswords" :disabled="!bulkPwds.trim()">导入</button>
+      </div>
+      <!-- Password table -->
+      <div class="card table-wrap">
+        <table>
+          <thead><tr><th>密码</th><th>标签</th><th>命中次数</th><th>添加时间</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in passwords" :key="p.id" :style="p.hit_count>0?{background:'rgba(251,191,36,0.04)'}:{}">
+              <td>
+                <span :style="{fontFamily:'monospace',fontSize:'13px',color:p.hit_count>0?'#fbbf24':'#e2e8f0'}"
+                  @mouseenter="p._show=true" @mouseleave="p._show=false">
+                  {{ p._show ? p.password : '●'.repeat(Math.min(p.password.length, 8)) }}
+                </span>
+                <span v-if="p.hit_count===Math.max(...passwords.map(x=>x.hit_count)) && p.hit_count>0" style="margin-left:6px;font-size:10px;">👑</span>
+              </td>
+              <td>{{ p.tag || '-' }}</td>
+              <td>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span :style="{color:p.hit_count>0?'#fbbf24':'var(--dim)'}">{{ p.hit_count }} 次</span>
+                  <div v-if="maxHitCount>0" style="height:4px;width:60px;background:rgba(255,255,255,0.07);border-radius:2px;overflow:hidden;">
+                    <div :style="{width:(p.hit_count/maxHitCount*100)+'%',height:'100%',background:'#fbbf24',borderRadius:'2px'}"></div>
+                  </div>
+                </div>
+              </td>
+              <td style="font-size:11px;">{{ p.created_at ? p.created_at.slice(0,16) : '-' }}</td>
+              <td><button class="btn btn-danger" style="font-size:11px;padding:3px 8px;" @click="deletePassword(p.id)">删除</button></td>
+            </tr>
+            <tr v-if="!passwords.length"><td colspan="5" style="text-align:center;padding:32px;color:var(--dim);">暂无密码，添加后解压加密文件时自动尝试</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-if="passwords.length>10" style="margin-top:10px;font-size:12px;color:var(--dim);padding:10px 14px;background:rgba(245,158,11,0.05);border:1px solid rgba(245,158,11,0.15);border-radius:8px;">
+        ⚠️ 密码越多解压耗时越长，建议保留常用密码
+      </div>
+    </div>
+
+    <!-- File Browser -->
+    <div v-if="activeTab==='files'" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+        <div><h1 style="font-size:22px;font-weight:700;">文件浏览</h1></div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <select v-model="quickJumpDir" @change="browseDir(quickJumpDir)" class="input" style="width:200px;">
+            <option value="">快速跳转...</option>
+            <option v-for="d in watchDirs" :key="d.id" :value="d.watch_path">📁 {{ d.watch_path }}</option>
+            <option v-for="d in watchDirs" :key="'o'+d.id" :value="d.output_path">📦 {{ d.output_path }}</option>
+          </select>
+        </div>
+      </div>
+      <!-- Breadcrumb -->
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:16px;font-size:13px;">
+        <span v-for="(seg, i) in fileBreadcrumb" :key="i">
+          <span v-if="i>0" style="color:var(--dim);margin:0 2px;">/</span>
+          <span @click="browseDir(seg.path)" :style="{cursor:'pointer',color:i===fileBreadcrumb.length-1?'#e2e8f0':'#818cf8'}">{{ seg.name || '/' }}</span>
+        </span>
+      </div>
+      <!-- File list -->
+      <div class="card table-wrap">
+        <div v-if="fileLoading" style="padding:48px;text-align:center;color:var(--dim);">
+          <div class="spinner" style="width:24px;height:24px;margin:0 auto;"></div>
+        </div>
+        <table v-else>
+          <thead><tr><th>名称</th><th>类型</th><th>大小</th><th>修改时间</th></tr></thead>
+          <tbody>
+            <tr v-if="fileData.parent" @click="browseDir(fileData.parent)" style="cursor:pointer;">
+              <td colspan="4" style="color:#818cf8;">📂 ..</td>
+            </tr>
+            <tr v-for="f in fileData.items" :key="f.path" @click="f.is_dir && browseDir(f.path)" :style="f.is_dir?{cursor:'pointer'}:{}">
+              <td>
+                <span style="margin-right:6px;">{{ f.is_dir ? '📁' : f.is_archive ? '📦' : '📄' }}</span>
+                <span :style="{color:f.is_dir?'#93c5fd':f.is_archive?'#c084fc':'#e2e8f0'}">{{ f.name }}</span>
+              </td>
+              <td style="font-size:11px;">{{ f.is_dir ? '目录' : f.is_archive ? '压缩包' : '文件' }}</td>
+              <td>{{ f.is_dir ? '-' : fmtSize(f.size) }}</td>
+              <td style="font-size:11px;">{{ f.modified_at }}</td>
+            </tr>
+            <tr v-if="!fileLoading && fileData.items && !fileData.items.length && !fileData.parent">
+              <td colspan="4" style="text-align:center;padding:32px;color:var(--dim);">目录为空</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div v-if="activeTab==='logs'" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+        <div><h1 style="font-size:22px;font-weight:700;">实时日志</h1></div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <select v-model="logFilter" @change="loadLogs" class="input" style="width:120px;">
+            <option value="">全部</option>
+            <option value="info">INFO</option>
+            <option value="warning">WARNING</option>
+            <option value="error">ERROR</option>
+          </select>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted);">
+            <input type="checkbox" v-model="logAutoScroll"> 自动滚动
+          </label>
+          <button class="btn btn-ghost" style="font-size:12px;" @click="clearLogsDisplay">清空显示</button>
+          <button class="btn btn-ghost" style="font-size:12px;" @click="loadLogs">刷新</button>
+        </div>
+      </div>
+      <div class="card" style="padding:16px;">
+        <div ref="logContainer" style="height:calc(100vh - 240px);overflow-y:auto;font-family:'Menlo','Monaco','Consolas',monospace;" class="scrollbar-light">
+          <div v-for="log in displayedLogs" :key="log.id || log._key" :class="['log-entry', 'log-'+log.level]">
+            <span style="color:var(--dim);">[{{ log.created_at ? log.created_at.slice(0,19) : '' }}]</span>
+            <span :class="'log-'+log.level" style="margin:0 6px;font-weight:700;">{{ (log.level||'info').toUpperCase() }}</span>
+            <span>{{ log.message }}</span>
+          </div>
+          <div v-if="!displayedLogs.length" style="text-align:center;padding:48px;color:var(--dim);">暂无日志</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div v-if="activeTab==='settings'" style="padding:28px;max-width:720px;">
+      <div style="margin-bottom:24px;"><h1 style="font-size:22px;font-weight:700;">全局设置</h1></div>
+
+      <div class="card" style="padding:20px;margin-bottom:16px;">
+        <div style="font-size:14px;font-weight:600;color:#818cf8;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:10px;">⚙️ 解压设置</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+          <div>
+            <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">扫描间隔（秒）</label>
+            <input v-model="settings.check_interval" type="number" min="10" class="input">
+            <p style="font-size:11px;color:var(--dim);margin-top:4px;">定时扫描监控目录的频率</p>
+          </div>
+          <div>
+            <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">最大嵌套深度</label>
+            <input v-model="settings.max_depth" type="number" min="1" max="10" class="input">
+            <p style="font-size:11px;color:var(--dim);margin-top:4px;">递归解压的最大层数</p>
+          </div>
+          <div>
+            <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">并发任务数</label>
+            <input v-model="settings.concurrent_tasks" type="number" min="1" max="10" class="input">
+            <p style="font-size:11px;color:var(--dim);margin-top:4px;">同时解压的最大任务数</p>
+          </div>
+          <div>
+            <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">稳定性等待（秒）</label>
+            <input v-model="settings.stability_wait" type="number" min="1" max="60" class="input">
+            <p style="font-size:11px;color:var(--dim);margin-top:4px;">检测文件是否完成下载的等待时间</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="padding:20px;margin-bottom:16px;">
+        <div style="font-size:14px;font-weight:600;color:#818cf8;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:10px;">🔧 路径设置</div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">7-Zip 可执行文件路径</label>
+          <input v-model="settings.sevenzip_path" placeholder="/usr/local/bin/7zzs" class="input">
+          <p style="font-size:11px;color:var(--dim);margin-top:4px;">7zzs 或 7z 的完整路径，也可通过环境变量 SEVENZIP_PATH 设置</p>
+        </div>
+      </div>
+
+      <div class="card" style="padding:20px;margin-bottom:20px;">
+        <div style="font-size:14px;font-weight:600;color:#818cf8;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:10px;">🔑 密码设置</div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">全局密码字典（每行一个，会与自定义密码合并）</label>
+          <textarea v-model="settings.password_dict" class="input" style="height:140px;resize:vertical;font-family:monospace;font-size:12px;"></textarea>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" @click="saveSettings" :disabled="settingSaving" style="min-width:100px;">
+        <span v-if="settingSaving" class="spinner"></span>
+        <span v-else>💾 保存设置</span>
+      </button>
+    </div>
+
+  </div><!-- /main -->
+
+  <!-- Modal: Add Watch Dir -->
+  <div v-if="showDirModal" class="modal-bg" @click.self="showDirModal=false">
+    <div class="modal">
+      <h2 style="font-size:16px;font-weight:700;margin-bottom:20px;">📁 添加监控目录</h2>
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">监控路径 <span style="color:#f87171;">*</span></label>
+          <input v-model="newDir.watch_path" placeholder="/path/to/watch" class="input">
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">解压输出路径 <span style="color:#f87171;">*</span></label>
+          <input v-model="newDir.output_path" placeholder="/path/to/output" class="input">
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--muted);">
+          <input type="checkbox" v-model="newDir.auto_delete"> 解压后自动删除原压缩包
+        </label>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px;">
+        <button class="btn btn-ghost" @click="showDirModal=false">取消</button>
+        <button class="btn btn-primary" @click="addDir" :disabled="!newDir.watch_path||!newDir.output_path">确认添加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast-container">
+    <div v-for="t in toasts" :key="t.id" :class="['toast','toast-'+t.type]">
+      <span>{{ t.type==='success'?'✅':t.type==='error'?'❌':'ℹ️' }}</span>
+      <span>{{ t.message }}</span>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<script>
+const { createApp, ref, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
+createApp({
+  setup() {
+    const activeTab = ref('dashboard');
+    const navItems = [
+      { id: 'dashboard', icon: '📊', name: '仪表盘' },
+      { id: 'dirs', icon: '📁', name: '监控目录' },
+      { id: 'history', icon: '📜', name: '解压历史' },
+      { id: 'passwords', icon: '🔑', name: '密码管理' },
+      { id: 'files', icon: '📂', name: '文件浏览' },
+      { id: 'logs', icon: '📝', name: '实时日志' },
+      { id: 'settings', icon: '⚙️', name: '设置' },
+    ];
+
+    // Data
+    const stats = ref({ total_archives:0, success_count:0, failed_count:0, pending_count:0, watch_dirs_count:0, passwords_count:0, today_success:0, today_failed:0, processing_count:0 });
+    const recentHistory = ref([]);
+    const watchDirs = ref([]);
+    const passwords = ref([]);
+    const settings = ref({ check_interval:'60', max_depth:'3', concurrent_tasks:'2', stability_wait:'5', sevenzip_path:'/usr/local/bin/7zzs', password_dict:'' });
+    const historyItems = ref([]);
+    const historyTotal = ref(0);
+    const historyPage = ref(1);
+    const historyPageSize = 20;
+    const historyFilter = ref({ status:'', search:'' });
+    const expandedHistory = ref(null);
+    const displayedLogs = ref([]);
+    const logFilter = ref('');
+    const logAutoScroll = ref(true);
+    const logContainer = ref(null);
+    const fileData = ref({ path:'', parent:null, items:[] });
+    const fileLoading = ref(false);
+    const quickJumpDir = ref('');
+    const fileBreadcrumb = ref([]);
+    const toasts = ref([]);
+    const showDirModal = ref(false);
+    const newDir = ref({ watch_path:'', output_path:'', auto_delete:false });
+    const newPwd = ref({ password:'', tag:'' });
+    const bulkPwds = ref('');
+    const scanningId = ref(null);
+    const settingSaving = ref(false);
+
+    const api = axios.create({ baseURL: '', timeout: 15000 });
+    let pollTimer = null;
+    let histDebounceTimer = null;
+    let wsConn = null;
+    let logKeyCounter = 0;
+
+    const successRate = computed(() => {
+      const t = stats.value.total_archives;
+      if (!t) return 0;
+      return Math.round(stats.value.success_count / t * 100);
+    });
+    const historyTotalPages = computed(() => Math.max(1, Math.ceil(historyTotal.value / historyPageSize)));
+    const maxHitCount = computed(() => passwords.value.length ? Math.max(...passwords.value.map(p => p.hit_count)) : 0);
+
+    function toast(message, type='info') {
+      const id = Date.now();
+      toasts.value.push({ id, message, type });
+      setTimeout(() => { toasts.value = toasts.value.filter(t => t.id !== id); }, 3500);
+    }
+
+    function fmtSize(bytes) {
+      if (!bytes || bytes === 0) return '0 B';
+      const k = 1024, sizes = ['B','KB','MB','GB','TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+    function statusBadge(s) {
+      return { success:'badge-success', failed:'badge-error', processing:'badge-warning', pending:'badge-info' }[s] || 'badge-info';
+    }
+    function statusText(s) {
+      return { success:'成功', failed:'失败', processing:'处理中', pending:'等待' }[s] || s;
+    }
+
+    async function loadDashboard() {
+      try {
+        const [d, h] = await Promise.all([
+          api.get('/api/dashboard'),
+          api.get('/api/history?page=1&page_size=10')
+        ]);
+        stats.value = d.data;
+        recentHistory.value = d.data.items || h.data.items || [];
+      } catch(e) {}
+    }
+
+    async function loadWatchDirs() {
+      try { watchDirs.value = (await api.get('/api/watch-dirs')).data; } catch(e) {}
+    }
+
+    async function loadPasswords() {
+      try {
+        passwords.value = ((await api.get('/api/passwords')).data).map(p => ({...p, _show: false}));
+      } catch(e) {}
+    }
+
+    async function loadHistory(page) {
+      if (page !== undefined) historyPage.value = page;
+      const p = historyPage.value;
+      try {
+        const r = await api.get('/api/history', { params: { page: p, page_size: historyPageSize, status: historyFilter.value.status, search: historyFilter.value.search } });
+        historyItems.value = r.data.items;
+        historyTotal.value = r.data.total;
+      } catch(e) {}
+    }
+
+    async function loadLogs() {
+      try {
+        const r = await api.get('/api/logs', { params: { limit: 300, level: logFilter.value } });
+        displayedLogs.value = r.data.map(l => ({...l, _key: l.id})).reverse();
+        if (logAutoScroll.value) scrollLogsToBottom();
+      } catch(e) {}
+    }
+
+    async function loadSettings() {
+      try { settings.value = { ...settings.value, ...(await api.get('/api/settings')).data }; } catch(e) {}
+    }
+
+    function scrollLogsToBottom() {
+      nextTick(() => {
+        if (logContainer.value) logContainer.value.scrollTop = logContainer.value.scrollHeight;
+      });
+    }
+
+    function clearLogsDisplay() { displayedLogs.value = []; }
+
+    function debounceHistory() {
+      clearTimeout(histDebounceTimer);
+      histDebounceTimer = setTimeout(() => loadHistory(1), 400);
+    }
+
+    function toggleHistoryDetail(id) {
+      expandedHistory.value = expandedHistory.value === id ? null : id;
+    }
+
+    async function addDir() {
+      try {
+        await api.post('/api/watch-dirs', newDir.value);
+        showDirModal.value = false;
+        newDir.value = { watch_path:'', output_path:'', auto_delete:false };
+        await loadWatchDirs();
+        toast('监控目录已添加', 'success');
+      } catch(e) { toast(e.response?.data?.detail || '添加失败', 'error'); }
+    }
+
+    async function deleteDir(id) {
+      if (!confirm('确认删除该监控目录？')) return;
+      try {
+        await api.delete('/api/watch-dirs/' + id);
+        await loadWatchDirs();
+        toast('已删除', 'success');
+      } catch(e) { toast('删除失败', 'error'); }
+    }
+
+    async function toggleDir(id, enabled) {
+      try {
+        await api.put('/api/watch-dirs/' + id + '/toggle?enabled=' + enabled);
+        await loadWatchDirs();
+      } catch(e) { toast('切换失败', 'error'); }
+    }
+
+    async function scanDir(id) {
+      scanningId.value = id;
+      try {
+        await api.get('/api/watch-dirs/' + id + '/scan');
+        toast('扫描已触发', 'info');
+      } catch(e) { toast('扫描失败', 'error'); }
+      finally { setTimeout(() => { scanningId.value = null; }, 1500); }
+    }
+
+    async function retryHistory(id) {
+      try {
+        await api.post('/api/history/' + id + '/retry');
+        toast('已重新加入队列', 'success');
+        setTimeout(() => loadHistory(), 1500);
+      } catch(e) { toast('重试失败', 'error'); }
+    }
+
+    async function deleteHistoryItem(id) {
+      try {
+        await api.delete('/api/history/' + id);
+        await loadHistory();
+        toast('已删除', 'success');
+      } catch(e) { toast('删除失败', 'error'); }
+    }
+
+    async function confirmClearHistory() {
+      if (!confirm('确认清空所有历史记录？此操作不可恢复。')) return;
+      try {
+        await api.delete('/api/history/clear');
+        await loadHistory(1);
+        toast('历史记录已清空', 'success');
+      } catch(e) { toast('清空失败', 'error'); }
+    }
+
+    async function addPassword() {
+      if (!newPwd.value.password) return;
+      try {
+        await api.post('/api/passwords', { password: newPwd.value.password, tag: newPwd.value.tag });
+        newPwd.value = { password:'', tag:'' };
+        await loadPasswords();
+        toast('密码已添加', 'success');
+      } catch(e) { toast(e.response?.data?.detail || '添加失败（可能已存在）', 'error'); }
+    }
+
+    async function deletePassword(id) {
+      try {
+        await api.delete('/api/passwords/' + id);
+        await loadPasswords();
+        toast('已删除', 'success');
+      } catch(e) { toast('删除失败', 'error'); }
+    }
+
+    async function importPasswords() {
+      const lines = bulkPwds.value.split('\n').filter(l => l.trim());
+      let ok = 0, fail = 0;
+      for (const l of lines) {
+        try { await api.post('/api/passwords', { password: l.trim(), tag: 'bulk' }); ok++; }
+        catch { fail++; }
+      }
+      bulkPwds.value = '';
+      await loadPasswords();
+      toast(`导入完成：成功 ${ok}，跳过 ${fail}`, 'info');
+    }
+
+    async function saveSettings() {
+      settingSaving.value = true;
+      try {
+        await api.put('/api/settings', settings.value);
+        toast('设置已保存', 'success');
+      } catch(e) { toast('保存失败', 'error'); }
+      finally { settingSaving.value = false; }
+    }
+
+    async function browseDir(path) {
+      if (!path) return;
+      fileLoading.value = true;
+      quickJumpDir.value = '';
+      try {
+        const r = await api.get('/api/files', { params: { path } });
+        fileData.value = r.data;
+        // Build breadcrumb
+        const parts = path.replace(/\/$/, '').split('/').filter(Boolean);
+        fileBreadcrumb.value = [{ name: '/', path: '/' }];
+        let cumPath = '';
+        for (const p of parts) {
+          cumPath += '/' + p;
+          fileBreadcrumb.value.push({ name: p, path: cumPath });
+        }
+      } catch(e) { toast('无法访问该目录', 'error'); }
+      finally { fileLoading.value = false; }
+    }
+
+    function connectWS() {
+      try {
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        wsConn = new WebSocket(`${proto}://${location.host}/ws/logs`);
+        wsConn.onmessage = (e) => {
+          try {
+            const items = JSON.parse(e.data);
+            if (!Array.isArray(items) || !items.length) return;
+            if (logFilter.value && !items.every(i => i.level === logFilter.value)) {
+              const filtered = items.filter(i => !logFilter.value || i.level === logFilter.value);
+              if (!filtered.length) return;
+            }
+            for (const item of items) {
+              if (!logFilter.value || item.level === logFilter.value) {
+                item._key = ++logKeyCounter;
+                displayedLogs.value.push(item);
+              }
+            }
+            if (displayedLogs.value.length > 500) displayedLogs.value = displayedLogs.value.slice(-500);
+            if (logAutoScroll.value) scrollLogsToBottom();
+          } catch {}
+        };
+        wsConn.onclose = () => { setTimeout(connectWS, 5000); };
+        wsConn.onerror = () => { wsConn.close(); };
+      } catch(e) {}
+    }
+
+    onMounted(async () => {
+      await Promise.all([loadDashboard(), loadWatchDirs(), loadPasswords(), loadSettings()]);
+      await loadHistory(1);
+      await loadLogs();
+      // Auto-browse first watch dir
+      if (watchDirs.value.length) browseDir(watchDirs.value[0].watch_path);
+      connectWS();
+      // Polling for dashboard/stats
+      pollTimer = setInterval(() => {
+        loadDashboard();
+        if (activeTab.value === 'history') loadHistory();
+      }, 10000);
+    });
+
+    onUnmounted(() => {
+      if (pollTimer) clearInterval(pollTimer);
+      if (wsConn) wsConn.close();
+    });
+
+    return {
+      activeTab, navItems, stats, recentHistory, watchDirs, passwords, settings,
+      historyItems, historyTotal, historyPage, historyFilter, expandedHistory,
+      displayedLogs, logFilter, logAutoScroll, logContainer,
+      fileData, fileLoading, quickJumpDir, fileBreadcrumb,
+      toasts, showDirModal, newDir, newPwd, bulkPwds,
+      scanningId, settingSaving,
+      successRate, historyTotalPages, maxHitCount,
+      fmtSize, statusBadge, statusText,
+      loadDashboard, loadHistory, loadLogs,
+      addDir, deleteDir, toggleDir, scanDir,
+      retryHistory, deleteHistoryItem, confirmClearHistory,
+      addPassword, deletePassword, importPasswords,
+      saveSettings, browseDir, clearLogsDisplay, debounceHistory, toggleHistoryDetail,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

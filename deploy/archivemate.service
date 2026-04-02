@@ -1,0 +1,18 @@
+[Unit]
+Description=ArchiveMate - Auto Extraction Service
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/auto-extractor/backend
+Environment=APP_BASE_DIR=/path/to/auto-extractor
+Environment=SEVENZIP_PATH=/path/to/auto-extractor/backend/bin/7zzs
+ExecStart=/usr/bin/python3 /path/to/auto-extractor/backend/main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/path/to/auto-extractor/logs/host.log
+StandardError=append:/path/to/auto-extractor/logs/host.log
+
+[Install]
+WantedBy=multi-user.target
