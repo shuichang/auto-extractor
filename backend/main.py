@@ -311,8 +311,8 @@ class ArchiveExtractor:
 
         sz_path = get_sevenzip_path()
         cmd = [sz_path, 'x', str(primary), f'-o{output_subdir}', '-y', '-sccUTF-8']
-        if password:
-            cmd.append(f'-p{password}')
+        # 始终传入 -p 参数（即使为空），避免 Rar5 加密文件等待交互式密码输入卡死
+        cmd.append(f'-p{password}')
 
         try:
             result = subprocess.run(
@@ -322,9 +322,12 @@ class ArchiveExtractor:
             stdout = result.stdout + result.stderr
             stdout_lower = stdout.lower()
 
-            if result.returncode == 2 and 'wrong password' in stdout_lower:
+            # 密码错误的各种表现
+            if 'wrong password' in stdout_lower:
                 return ExtractionResult(False, error="wrong password")
-            if result.returncode == 255 and not password:
+            if 'enter password' in stdout_lower:
+                return ExtractionResult(False, error="wrong password")
+            if result.returncode == 2 and ('encrypted' in stdout_lower or 'password' in stdout_lower):
                 return ExtractionResult(False, error="wrong password")
 
             extracted_files = [f for f in output_subdir.rglob('*') if f.is_file()]
