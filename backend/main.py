@@ -62,8 +62,11 @@ logger = logging.getLogger("archivemate")
 db_lock = threading.Lock()
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # WAL 模式允许读写并发
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=10000")  # 10秒等待
     return conn
 
 def init_db():
@@ -151,13 +154,12 @@ def init_db():
             conn.close()
 
 def get_setting(key: str, default: str = "") -> str:
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            return row[0] if row else default
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
 
 def get_sevenzip_path() -> str:
     env_path = os.environ.get("SEVENZIP_PATH", "")
@@ -233,25 +235,24 @@ def is_quick_stable(path: str) -> bool:
         return False
 
 def get_all_passwords() -> List[str]:
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT password FROM passwords ORDER BY hit_count DESC").fetchall()
-            custom = [r[0] for r in rows]
-            dict_val = conn.execute("SELECT value FROM settings WHERE key='password_dict'").fetchone()
-            dict_passwords = []
-            if dict_val:
-                dict_passwords = [p.strip() for p in dict_val[0].split('\n') if p.strip()]
-            # custom passwords first (higher hit rate), then dict
-            seen = set()
-            result = []
-            for p in custom + dict_passwords:
-                if p not in seen:
-                    seen.add(p)
-                    result.append(p)
-            return result
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT password FROM passwords ORDER BY hit_count DESC").fetchall()
+        custom = [r[0] for r in rows]
+        dict_val = conn.execute("SELECT value FROM settings WHERE key='password_dict'").fetchone()
+        dict_passwords = []
+        if dict_val:
+            dict_passwords = [p.strip() for p in dict_val[0].split('\n') if p.strip()]
+        # custom passwords first (higher hit rate), then dict
+        seen = set()
+        result = []
+        for p in custom + dict_passwords:
+            if p not in seen:
+                seen.add(p)
+                result.append(p)
+        return result
+    finally:
+        conn.close()
 
 # ============== 解压引擎 ==============
 class ExtractionResult:
@@ -417,13 +418,12 @@ def get_semaphore() -> threading.Semaphore:
     return _semaphore
 
 def is_done(file_path: str) -> bool:
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute("SELECT id FROM done_files WHERE file_path=?", (file_path,)).fetchone()
-            return row is not None
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id FROM done_files WHERE file_path=?", (file_path,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 def queue_archive(archive_path: str, watch_dir_id: int, output_path: str):
     """入队处理一个压缩包，跳过已完成的和次分卷"""
@@ -559,12 +559,11 @@ def _add_pending(file_path: str, watch_dir_id: int):
         pass
 
 def _maybe_auto_delete(archive_path: str, watch_dir_id: int):
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute("SELECT auto_delete, output_path FROM watch_dirs WHERE id=?", (watch_dir_id,)).fetchone()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT auto_delete, output_path FROM watch_dirs WHERE id=?", (watch_dir_id,)).fetchone()
+    finally:
+        conn.close()
     if row and row[0]:
         try:
             Path(archive_path).unlink()
@@ -573,17 +572,21 @@ def _maybe_auto_delete(archive_path: str, watch_dir_id: int):
             log_task(f"删除原文件失败: {e}", "warning")
 
 def deep_extract(directory: str, root_output: str, depth: int = 1):
-    """递归处理解压出来的压缩包"""
+    """递归处理解压出来的压缩包 — 只扫本次解压的子目录，不递归扫全部输出目录"""
     max_depth = int(get_setting("max_depth", "3"))
     if depth >= max_depth:
         return
     dir_path = Path(directory)
     if not dir_path.exists():
         return
-    for item in dir_path.rglob("*"):
+    # 只遍历当前目录一层，对压缩包文件排队，对子目录再递归
+    for item in dir_path.iterdir():
         if item.is_file() and is_archive(str(item)) and not is_volume_secondary(str(item)):
             if not is_done(str(item)):
-                queue_archive(str(item), 0, root_output)
+                # 子压缩包解压到同目录下
+                queue_archive(str(item), 0, str(dir_path))
+        elif item.is_dir():
+            deep_extract(str(item), root_output, depth + 1)
 
 
 # ============== 文件监控 ==============
@@ -663,19 +666,25 @@ def _scan_dir(wid: int, watch_path: str, output_path: str):
     p = Path(watch_path)
     if not p.exists():
         return
+    output_p = Path(output_path)
     for item in p.rglob("*"):
+        # 跳过输出目录本身（避免把已解压内容里的压缩包重复处理）
+        try:
+            item.relative_to(output_p)
+            continue  # item is inside output_path, skip
+        except ValueError:
+            pass
         if item.is_file() and is_archive(str(item)) and not is_volume_secondary(str(item)):
             if not is_done(str(item)):
                 queue_archive(str(item), wid, output_path)
 
 def _check_pending():
     """检查等待队列中的文件是否稳定了"""
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT id, file_path, watch_dir_id, last_size, last_mtime FROM pending_files").fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT id, file_path, watch_dir_id, last_size, last_mtime FROM pending_files").fetchall()
+    finally:
+        conn.close()
 
     for row in rows:
         pid, file_path, wid, last_size, last_mtime = row
@@ -723,12 +732,11 @@ def _check_pending():
 
 def restore_watchers():
     time.sleep(2)
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT id, watch_path, output_path FROM watch_dirs WHERE enabled=1").fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT id, watch_path, output_path FROM watch_dirs WHERE enabled=1").fetchall()
+    finally:
+        conn.close()
     for row in rows:
         watcher.add_path(row[1], row[0], row[2])
 
@@ -813,25 +821,24 @@ class DashboardStats(BaseModel):
 # ============== API: Dashboard ==============
 @app.get("/api/dashboard", response_model=DashboardStats)
 def get_dashboard():
-    with db_lock:
-        conn = get_db()
-        try:
-            total = conn.execute("SELECT COUNT(*) FROM archive_history").fetchone()[0]
-            success = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='success'").fetchone()[0]
-            failed = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='failed'").fetchone()[0]
-            pending = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='pending'").fetchone()[0]
-            processing = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='processing'").fetchone()[0]
-            dirs_count = conn.execute("SELECT COUNT(*) FROM watch_dirs").fetchone()[0]
-            pwd_count = conn.execute("SELECT COUNT(*) FROM passwords").fetchone()[0]
-            today = datetime.now().strftime("%Y-%m-%d")
-            today_success = conn.execute(
-                "SELECT COUNT(*) FROM archive_history WHERE status='success' AND completed_at LIKE ?", (f"{today}%",)
-            ).fetchone()[0]
-            today_failed = conn.execute(
-                "SELECT COUNT(*) FROM archive_history WHERE status='failed' AND completed_at LIKE ?", (f"{today}%",)
-            ).fetchone()[0]
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM archive_history").fetchone()[0]
+        success = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='success'").fetchone()[0]
+        failed = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='failed'").fetchone()[0]
+        pending = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='pending'").fetchone()[0]
+        processing = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='processing'").fetchone()[0]
+        dirs_count = conn.execute("SELECT COUNT(*) FROM watch_dirs").fetchone()[0]
+        pwd_count = conn.execute("SELECT COUNT(*) FROM passwords").fetchone()[0]
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_success = conn.execute(
+            "SELECT COUNT(*) FROM archive_history WHERE status='success' AND completed_at LIKE ?", (f"{today}%",)
+        ).fetchone()[0]
+        today_failed = conn.execute(
+            "SELECT COUNT(*) FROM archive_history WHERE status='failed' AND completed_at LIKE ?", (f"{today}%",)
+        ).fetchone()[0]
+    finally:
+        conn.close()
     return DashboardStats(
         total_archives=total, success_count=success, failed_count=failed,
         pending_count=pending, watch_dirs_count=dirs_count, passwords_count=pwd_count,
@@ -841,12 +848,11 @@ def get_dashboard():
 # ============== API: Watch Dirs ==============
 @app.get("/api/watch-dirs", response_model=List[WatchDirOut])
 def list_watch_dirs():
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs ORDER BY id DESC").fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
     return [WatchDirOut(id=r[0], watch_path=r[1], output_path=r[2], enabled=bool(r[3]), auto_delete=bool(r[4]), created_at=r[5]) for r in rows]
 
 @app.post("/api/watch-dirs", response_model=WatchDirOut)
@@ -901,12 +907,11 @@ def toggle_watch_dir(wid: int, enabled: bool):
 
 @app.get("/api/watch-dirs/{wid}/scan")
 def scan_watch_dir(wid: int):
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute("SELECT watch_path, output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT watch_path, output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
+    finally:
+        conn.close()
     if not row:
         raise HTTPException(404, "目录不存在")
     threading.Thread(target=_scan_dir, args=(wid, row[0], row[1]), daemon=True).start()
@@ -917,24 +922,23 @@ def scan_watch_dir(wid: int):
 @app.get("/api/history", response_model=HistoryPage)
 def list_history(status: str = "", search: str = "", page: int = 1, page_size: int = 20):
     offset = (page - 1) * page_size
-    with db_lock:
-        conn = get_db()
-        try:
-            where = "WHERE 1=1"
-            params = []
-            if status:
-                where += " AND status=?"
-                params.append(status)
-            if search:
-                where += " AND original_path LIKE ?"
-                params.append(f"%{search}%")
-            total = conn.execute(f"SELECT COUNT(*) FROM archive_history {where}", params).fetchone()[0]
-            rows = conn.execute(
-                f"SELECT id,original_path,output_path,status,file_size,password_used,error_message,extracted_size,file_count,duration_seconds,created_at,completed_at FROM archive_history {where} ORDER BY id DESC LIMIT ? OFFSET ?",
-                params + [page_size, offset]
-            ).fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        where = "WHERE 1=1"
+        params = []
+        if status:
+            where += " AND status=?"
+            params.append(status)
+        if search:
+            where += " AND original_path LIKE ?"
+            params.append(f"%{search}%")
+        total = conn.execute(f"SELECT COUNT(*) FROM archive_history {where}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT id,original_path,output_path,status,file_size,password_used,error_message,extracted_size,file_count,duration_seconds,created_at,completed_at FROM archive_history {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, offset]
+        ).fetchall()
+    finally:
+        conn.close()
     cols = ['id','original_path','output_path','status','file_size','password_used','error_message','extracted_size','file_count','duration_seconds','created_at','completed_at']
     items = [HistoryItem(**dict(zip(cols, r))) for r in rows]
     return HistoryPage(items=items, total=total, page=page, page_size=page_size)
@@ -963,12 +967,11 @@ def delete_history(hid: int):
 
 @app.post("/api/history/{hid}/retry")
 def retry_history(hid: int):
-    with db_lock:
-        conn = get_db()
-        try:
-            row = conn.execute("SELECT original_path FROM archive_history WHERE id=?", (hid,)).fetchone()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT original_path FROM archive_history WHERE id=?", (hid,)).fetchone()
+    finally:
+        conn.close()
     if not row:
         raise HTTPException(404, "记录不存在")
     archive_path = row[0]
@@ -995,12 +998,11 @@ def retry_history(hid: int):
 # ============== API: Passwords ==============
 @app.get("/api/passwords", response_model=List[PasswordOut])
 def list_passwords():
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT id,password,tag,hit_count,created_at FROM passwords ORDER BY hit_count DESC, id DESC").fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT id,password,tag,hit_count,created_at FROM passwords ORDER BY hit_count DESC, id DESC").fetchall()
+    finally:
+        conn.close()
     return [PasswordOut(id=r[0], password=r[1], tag=r[2], hit_count=r[3], created_at=r[4]) for r in rows]
 
 @app.post("/api/passwords", response_model=PasswordOut)
@@ -1032,12 +1034,11 @@ def delete_password(pid: int):
 # ============== API: Settings ==============
 @app.get("/api/settings")
 def get_settings():
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT key,value FROM settings").fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT key,value FROM settings").fetchall()
+    finally:
+        conn.close()
     return {r[0]: r[1] for r in rows}
 
 @app.put("/api/settings")
@@ -1055,15 +1056,14 @@ def update_settings(data: dict):
 # ============== API: Logs ==============
 @app.get("/api/logs", response_model=List[LogOut])
 def get_logs(limit: int = 200, level: str = ""):
-    with db_lock:
-        conn = get_db()
-        try:
-            if level:
-                rows = conn.execute("SELECT id,level,message,task_id,created_at FROM task_logs WHERE level=? ORDER BY id DESC LIMIT ?", (level, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT id,level,message,task_id,created_at FROM task_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        if level:
+            rows = conn.execute("SELECT id,level,message,task_id,created_at FROM task_logs WHERE level=? ORDER BY id DESC LIMIT ?", (level, limit)).fetchall()
+        else:
+            rows = conn.execute("SELECT id,level,message,task_id,created_at FROM task_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    finally:
+        conn.close()
     return [LogOut(id=r[0], level=r[1], message=r[2], task_id=r[3] or "", created_at=r[4]) for r in rows]
 
 @app.delete("/api/logs")
@@ -1111,12 +1111,11 @@ async def ws_logs(websocket: WebSocket):
     with _ws_subscribers_lock:
         _ws_subscribers.append(q)
     # Send last 50 logs on connect
-    with db_lock:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT level,message,created_at FROM task_logs ORDER BY id DESC LIMIT 50").fetchall()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT level,message,created_at FROM task_logs ORDER BY id DESC LIMIT 50").fetchall()
+    finally:
+        conn.close()
     try:
         await websocket.send_json([{"level": r[0], "message": r[1], "created_at": r[2]} for r in reversed(rows)])
         while True:
