@@ -149,6 +149,10 @@ def init_db():
                 ('sevenzip_path', '/usr/local/bin/7zzs'),
                 ('password_dict', 'password\n123456\n12345678\nqwerty\nadmin\n000000\n111111\n123123\n123456789\n1234567890\nabc123\n')
             """)
+            # 服务重启：将遗留的 processing 记录重置为 failed
+            conn.execute(
+                "UPDATE archive_history SET status='failed', error_message='服务重启，任务中断', completed_at=CURRENT_TIMESTAMP WHERE status='processing'"
+            )
             conn.commit()
         finally:
             conn.close()
@@ -471,8 +475,11 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 )
                 conn.commit()
                 if cur.lastrowid == 0:
-                    # Already exists, update status to processing
-                    conn.execute("UPDATE archive_history SET status='processing', completed_at=NULL, error_message=NULL WHERE original_path=? AND status='failed'", (archive_path,))
+                    # Already exists (INSERT OR IGNORE skipped), reset status to processing
+                    conn.execute(
+                        "UPDATE archive_history SET status='processing', completed_at=NULL, error_message=NULL WHERE original_path=?",
+                        (archive_path,)
+                    )
                     conn.commit()
                     row = conn.execute("SELECT id FROM archive_history WHERE original_path=? ORDER BY id DESC LIMIT 1", (archive_path,)).fetchone()
                     history_id = row[0] if row else None
