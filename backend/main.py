@@ -217,6 +217,84 @@ def is_volume_secondary(path: str) -> bool:
         return True
     return False
 
+def get_sibling_volumes(path: str) -> List[str]:
+    """返回与主卷同属一套分卷的所有文件路径（包括主卷本身），找不到规律返回空列表"""
+    p = Path(path)
+    name_lower = p.name.lower()
+    parent = p.parent
+    volumes = []
+
+    # .7z.001 / .zip.001 / .rar.001 / .001 系列
+    m = re.match(r'^(.*?)\.(\w+)\.0+1$', name_lower)
+    if m:
+        base_name = p.name[:m.end(1)]  # 保持原始大小写
+        ext = m.group(2)
+        i = 1
+        while True:
+            cand = parent / f"{base_name}.{ext}.{i:03d}"
+            if cand.exists():
+                volumes.append(str(cand))
+                i += 1
+            else:
+                break
+        return volumes
+
+    # .part01.rar / .part1.rar 系列
+    m2 = re.search(r'(\.part0*1\.rar)$', name_lower)
+    if m2:
+        prefix = p.name[:len(p.name) - len(m2.group(1))]
+        i = 1
+        while True:
+            # try both .part1.rar and .part01.rar style
+            found = False
+            for fmt in [f'.part{i}.rar', f'.part{i:02d}.rar', f'.part{i:03d}.rar']:
+                cand = parent / (prefix + fmt)
+                if cand.exists():
+                    volumes.append(str(cand))
+                    found = True
+                    break
+            if not found:
+                break
+            i += 1
+        return volumes
+
+    # .z01 系列
+    if name_lower.endswith('.z01'):
+        base_name = p.name[:-4]  # 去掉 .z01
+        volumes.append(str(p))
+        i = 2
+        while True:
+            cand = parent / f"{base_name}.z{i:02d}"
+            if cand.exists():
+                volumes.append(str(cand))
+                i += 1
+            else:
+                break
+        return volumes
+
+    return []
+
+def all_volumes_stable(archive_path: str, stability_wait: int = 3) -> bool:
+    """检查分卷压缩的所有分卷文件是否都已下载完成（稳定）"""
+    volumes = get_sibling_volumes(archive_path)
+    if not volumes:
+        return True  # 非分卷，不检查
+    for vol in volumes:
+        vp = Path(vol)
+        if not vp.exists():
+            logger.info(f"分卷尚未就绪: {vp.name}")
+            return False
+        try:
+            s1 = vp.stat()
+            time.sleep(stability_wait)
+            s2 = vp.stat()
+            if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
+                logger.info(f"分卷仍在写入: {vp.name}")
+                return False
+        except Exception:
+            return False
+    return True
+
 def is_file_stable(path: str, wait_seconds: int = 5) -> bool:
     """检测文件是否稳定（未在下载中）"""
     p = Path(path)
@@ -450,19 +528,57 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
     sem.acquire()
     history_id = None
     try:
-        # 文件稳定性检测
-        # Quick pre-check: compare size/mtime with a short sleep (don't hold semaphore during wait)
         p = Path(archive_path)
-        try:
-            s1 = p.stat()
-            time.sleep(3)
-            s2 = p.stat()
-            if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
-                log_task(f"文件仍在写入，延迟处理: {Path(archive_path).name}", "warning")
+        # 分卷完整性检查：等所有分卷都下载完毕才开始解压
+        volumes = get_sibling_volumes(archive_path)
+        if volumes:
+            all_ready = False
+            for attempt in range(30):  # 最多等 30 * 10s = 5分钟
+                missing = [v for v in volumes if not Path(v).exists()]
+                if missing:
+                    names = ', '.join(Path(v).name for v in missing)
+                    log_task(f"等待分卷下载: {names}", "info")
+                    sem.release()
+                    time.sleep(10)
+                    sem.acquire()
+                    continue
+                # 所有分卷存在，检查是否稳定（3秒内无变化）
+                unstable = []
+                for vol in volumes:
+                    vp = Path(vol)
+                    try:
+                        s1 = vp.stat()
+                        time.sleep(3)
+                        s2 = vp.stat()
+                        if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
+                            unstable.append(vp.name)
+                    except Exception:
+                        unstable.append(vp.name)
+                if unstable:
+                    names = ', '.join(unstable)
+                    log_task(f"分卷仍在写入，等待: {names}", "info")
+                    sem.release()
+                    time.sleep(10)
+                    sem.acquire()
+                    continue
+                all_ready = True
+                break
+            if not all_ready:
+                log_task(f"分卷等待超时，放弃: {Path(archive_path).name}", "warning")
                 _add_pending(archive_path, watch_dir_id)
                 return
-        except Exception:
-            return
+        else:
+            # 单文件稳定性检测
+            try:
+                s1 = p.stat()
+                time.sleep(3)
+                s2 = p.stat()
+                if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
+                    log_task(f"文件仍在写入，延迟处理: {p.name}", "warning")
+                    _add_pending(archive_path, watch_dir_id)
+                    return
+            except Exception:
+                return
 
         log_task(f"开始解压: {Path(archive_path).name}", "info")
         t_start = time.time()
