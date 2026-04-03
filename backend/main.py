@@ -10,7 +10,11 @@ import json
 import time
 import threading
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
+
+def now_local() -> str:
+    """返回本地时间字符串"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -48,14 +52,21 @@ def _find_sevenzip() -> str:
 SEVENZZ_PATH = _find_sevenzip()
 
 # ============== 日志 ==============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOGS_DIR / "archivemate.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+class _LocalTimeFormatter(logging.Formatter):
+    """使用本地时间而非 UTC 格式化日志时间"""
+    def formatTime(self, record, datefmt=None):
+        import time as _time
+        ct = _time.localtime(record.created)
+        if datefmt:
+            return _time.strftime(datefmt, ct)
+        return _time.strftime("%Y-%m-%d %H:%M:%S", ct)
+
+_log_fmt = _LocalTimeFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+_file_handler = logging.FileHandler(LOGS_DIR / "archivemate.log")
+_file_handler.setFormatter(_log_fmt)
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
 logger = logging.getLogger("archivemate")
 
 # ============== 数据库 ==============
@@ -151,7 +162,7 @@ def init_db():
             """)
             # 服务重启：将遗留的 processing 记录重置为 failed
             conn.execute(
-                "UPDATE archive_history SET status='failed', error_message='服务重启，任务中断', completed_at=CURRENT_TIMESTAMP WHERE status='processing'"
+                "UPDATE archive_history SET status='failed', error_message='服务重启，任务中断', completed_at=datetime('now','localtime') WHERE status='processing'"
             )
             conn.commit()
         finally:
@@ -637,7 +648,7 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 if result.success:
                     conn.execute(
                         """UPDATE archive_history SET status='success', output_path=?, password_used=?,
-                           extracted_size=?, file_count=?, duration_seconds=?, completed_at=CURRENT_TIMESTAMP
+                           extracted_size=?, file_count=?, duration_seconds=?, completed_at=datetime('now','localtime')
                            WHERE id=?""",
                         (result.output_path, result.password_used, result.extracted_size,
                          result.file_count, duration, history_id)
@@ -660,7 +671,7 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 else:
                     conn.execute(
                         """UPDATE archive_history SET status='failed', error_message=?,
-                           duration_seconds=?, completed_at=CURRENT_TIMESTAMP WHERE id=?""",
+                           duration_seconds=?, completed_at=datetime('now','localtime') WHERE id=?""",
                         (result.error, duration, history_id)
                     )
                     conn.commit()
@@ -674,7 +685,7 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
             with db_lock:
                 conn = get_db()
                 try:
-                    conn.execute("UPDATE archive_history SET status='failed', error_message=?, completed_at=CURRENT_TIMESTAMP WHERE id=?", (str(e), history_id))
+                    conn.execute("UPDATE archive_history SET status='failed', error_message=?, completed_at=datetime('now','localtime') WHERE id=?", (str(e), history_id))
                     conn.commit()
                 finally:
                     conn.close()
