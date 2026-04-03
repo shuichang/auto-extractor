@@ -532,41 +532,58 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
         # 分卷完整性检查：等所有分卷都下载完毕才开始解压
         volumes = get_sibling_volumes(archive_path)
         if volumes:
-            all_ready = False
-            for attempt in range(30):  # 最多等 30 * 10s = 5分钟
-                missing = [v for v in volumes if not Path(v).exists()]
-                if missing:
-                    names = ', '.join(Path(v).name for v in missing)
-                    log_task(f"等待分卷下载: {names}", "info")
-                    sem.release()
-                    time.sleep(10)
-                    sem.acquire()
-                    continue
-                # 所有分卷存在，检查是否稳定（3秒内无变化）
-                unstable = []
+            # 策略：只要文件还在变化（下载中）就一直等；
+            # 若某个分卷连续 STALL_ROUNDS 次检查大小/mtime 都没变化且文件不存在，才认为失败放弃。
+            # 已存在且稳定的分卷不重复计入 stall。
+            POLL_INTERVAL = 30        # 每30秒检查一次
+            STALL_ROUNDS   = 20       # 连续10分钟无任何进展才放弃（20 * 30s）
+            stall_counter  = 0
+            prev_snapshot: dict = {}  # vol_path -> (size, mtime)
+
+            while True:
+                # 刷新当前快照
+                cur_snapshot: dict = {}
                 for vol in volumes:
                     vp = Path(vol)
-                    try:
-                        s1 = vp.stat()
-                        time.sleep(3)
-                        s2 = vp.stat()
-                        if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
-                            unstable.append(vp.name)
-                    except Exception:
-                        unstable.append(vp.name)
-                if unstable:
+                    if vp.exists():
+                        try:
+                            st = vp.stat()
+                            cur_snapshot[vol] = (st.st_size, st.st_mtime)
+                        except Exception:
+                            cur_snapshot[vol] = (0, 0)
+
+                missing = [v for v in volumes if not Path(v).exists()]
+                unstable = []
+                for vol, (sz, mt) in cur_snapshot.items():
+                    prev = prev_snapshot.get(vol)
+                    if prev is None:
+                        unstable.append(Path(vol).name)  # 刚出现
+                    elif (sz, mt) != prev:
+                        unstable.append(Path(vol).name)  # 还在写入
+
+                if missing:
+                    names = ', '.join(Path(v).name for v in missing)
+                    log_task(f"等待分卷: {names} (共{len(volumes)}个)", "info")
+                    stall_counter = 0  # 还有文件没出现，重置 stall
+                elif unstable:
                     names = ', '.join(unstable)
-                    log_task(f"分卷仍在写入，等待: {names}", "info")
-                    sem.release()
-                    time.sleep(10)
-                    sem.acquire()
-                    continue
-                all_ready = True
-                break
-            if not all_ready:
-                log_task(f"分卷等待超时，放弃: {Path(archive_path).name}", "warning")
-                _add_pending(archive_path, watch_dir_id)
-                return
+                    log_task(f"分卷下载中: {names}", "info")
+                    stall_counter = 0  # 有进展，重置 stall
+                else:
+                    # 所有分卷存在且本轮快照与上轮一致 → 稳定
+                    log_task(f"所有分卷就绪，开始解压: {Path(archive_path).name}", "info")
+                    break
+
+                prev_snapshot = cur_snapshot
+                stall_counter += 1
+                if stall_counter >= STALL_ROUNDS:
+                    log_task(f"分卷长时间无进展，放弃: {Path(archive_path).name}", "warning")
+                    _add_pending(archive_path, watch_dir_id)
+                    return
+
+                sem.release()
+                time.sleep(POLL_INTERVAL)
+                sem.acquire()
         else:
             # 单文件稳定性检测
             try:
