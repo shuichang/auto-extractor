@@ -70,7 +70,7 @@ logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler
 logger = logging.getLogger("archivemate")
 
 # ============== 数据库 ==============
-db_lock = threading.Lock()
+db_lock = threading.RLock()  # 可重入锁，防止同一线程嵌套 acquire 死锁
 
 def get_db():
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
@@ -596,10 +596,17 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 time.sleep(POLL_INTERVAL)
                 sem.acquire()
         else:
-            # 单文件稳定性检测
+            # 单文件稳定性检测：释放信号量后等待，避免长时间占用并发槽
             try:
                 s1 = p.stat()
-                time.sleep(3)
+                if s1.st_size == 0:
+                    log_task(f"文件为空，延迟处理: {p.name}", "warning")
+                    _add_pending(archive_path, watch_dir_id)
+                    return
+                stability_secs = int(get_setting("stability_wait", "5"))
+                sem.release()
+                time.sleep(stability_secs)
+                sem.acquire()
                 s2 = p.stat()
                 if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
                     log_task(f"文件仍在写入，延迟处理: {p.name}", "warning")
@@ -852,27 +859,47 @@ def _check_pending():
                 finally:
                     conn.close()
             continue
+        # 如果当前已在处理中，跳过（不删 pending 记录，下轮再检查）
+        with processing_lock:
+            if file_path in processing_files:
+                logger.debug(f"pending 跳过（处理中）: {p.name}")
+                continue
         try:
             stat = p.stat()
             if stat.st_size == last_size and stat.st_mtime == last_mtime and stat.st_size > 0:
-                # File is stable now
-                with db_lock:
-                    conn = get_db()
-                    try:
-                        wd = conn.execute("SELECT output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
-                    finally:
-                        conn.close()
+                # File is stable — look up output path
+                conn = get_db()
+                try:
+                    wd = conn.execute("SELECT output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
+                finally:
+                    conn.close()
                 output_path = wd[0] if wd else str(BASE_DIR / "extracted")
-                with db_lock:
-                    conn = get_db()
-                    try:
-                        conn.execute("DELETE FROM pending_files WHERE id=?", (pid,))
-                        conn.commit()
-                    finally:
-                        conn.close()
-                queue_archive(file_path, wid, output_path)
+                logger.info(f"pending 文件就绪，准备解压: {p.name}")
+                # 先 queue，让 _worker 把它加入 processing_files；删除 pending 记录在 queue 确认入队后
+                with processing_lock:
+                    already = file_path in processing_files
+                if not already and not is_done(file_path):
+                    # 加入 processing_files 并启动 worker（queue_archive 内部会做）
+                    # 删除 pending 记录，让 queue_archive 正常处理
+                    with db_lock:
+                        conn = get_db()
+                        try:
+                            conn.execute("DELETE FROM pending_files WHERE id=?", (pid,))
+                            conn.commit()
+                        finally:
+                            conn.close()
+                    queue_archive(file_path, wid, output_path)
+                else:
+                    # 已完成或已在处理，直接删 pending
+                    with db_lock:
+                        conn = get_db()
+                        try:
+                            conn.execute("DELETE FROM pending_files WHERE id=?", (pid,))
+                            conn.commit()
+                        finally:
+                            conn.close()
             else:
-                # Update snapshot
+                # Still changing — update snapshot
                 with db_lock:
                     conn = get_db()
                     try:
@@ -881,8 +908,9 @@ def _check_pending():
                         conn.commit()
                     finally:
                         conn.close()
-        except:
-            pass
+                logger.debug(f"pending 文件仍在变化: {p.name} size={stat.st_size}")
+        except Exception as e:
+            logger.warning(f"_check_pending 异常: {p.name} — {e}")
 
 def restore_watchers():
     time.sleep(2)
