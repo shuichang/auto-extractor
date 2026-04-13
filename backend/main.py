@@ -131,6 +131,12 @@ def init_db():
                     archive_id INTEGER,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS failed_permanent (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL UNIQUE,
+                    archive_id INTEGER,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS pending_files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     file_path TEXT NOT NULL UNIQUE,
@@ -146,6 +152,7 @@ def init_db():
                 "ALTER TABLE archive_history ADD COLUMN extracted_size INTEGER DEFAULT 0",
                 "ALTER TABLE archive_history ADD COLUMN file_count INTEGER DEFAULT 0",
                 "ALTER TABLE archive_history ADD COLUMN duration_seconds REAL DEFAULT 0",
+                "ALTER TABLE archive_history ADD COLUMN all_passwords_failed INTEGER DEFAULT 0",
             ]:
                 try:
                     conn.execute(col_sql)
@@ -506,18 +513,22 @@ processing_files: set = set()
 processing_lock = threading.Lock()
 _semaphore: threading.Semaphore = None
 
-def get_semaphore() -> threading.Semaphore:
+def get_semaphore(refresh: bool = False) -> threading.Semaphore:
     global _semaphore
-    if _semaphore is None:
+    if _semaphore is None or refresh:
         n = int(get_setting("concurrent_tasks", "2"))
         _semaphore = threading.Semaphore(n)
     return _semaphore
 
 def is_done(file_path: str) -> bool:
+    """检查文件是否已处理完成（成功 or 密码耗尽永久跳过）"""
     conn = get_db()
     try:
         row = conn.execute("SELECT id FROM done_files WHERE file_path=?", (file_path,)).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        row2 = conn.execute("SELECT id FROM failed_permanent WHERE file_path=?", (file_path,)).fetchone()
+        return row2 is not None
     finally:
         conn.close()
 
@@ -532,6 +543,8 @@ def queue_archive(archive_path: str, watch_dir_id: int, output_path: str):
         if archive_path in processing_files:
             return
         processing_files.add(archive_path)
+    # 清除该文件可能遗留的 pending 记录（上次处理失败留下的脏数据）
+    _cleanup_pending(archive_path)
     threading.Thread(target=_worker, args=(archive_path, watch_dir_id, output_path), daemon=True).start()
 
 def _worker(archive_path: str, watch_dir_id: int, output_path: str):
@@ -590,10 +603,15 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 if stall_counter >= STALL_ROUNDS:
                     log_task(f"分卷长时间无进展，放弃: {Path(archive_path).name}", "warning")
                     _add_pending(archive_path, watch_dir_id)
+                    # 必须重新 acquire 平衡 semaphore，否则会泄漏
+                    sem = get_semaphore(refresh=True)
+                    sem.acquire()
                     return
 
                 sem.release()
                 time.sleep(POLL_INTERVAL)
+                # 重新读取 concurrent_tasks 设置，防止运行时修改不生效
+                sem = get_semaphore(refresh=True)
                 sem.acquire()
         else:
             # 单文件稳定性检测：释放信号量后等待，避免长时间占用并发槽
@@ -602,18 +620,21 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 if s1.st_size == 0:
                     log_task(f"文件为空，延迟处理: {p.name}", "warning")
                     _add_pending(archive_path, watch_dir_id)
-                    return
+                    return  # finally 块会正确释放 sem
                 stability_secs = int(get_setting("stability_wait", "5"))
+                # 释放信号量，让其他任务使用（这才是真正的并发控制）
                 sem.release()
                 time.sleep(stability_secs)
+                # 等待完成后重新 acquire（此时 sem 又多了一个可用 permit）
+                sem = get_semaphore(refresh=True)  # 重新读取 concurrent_tasks 设置
                 sem.acquire()
                 s2 = p.stat()
                 if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
                     log_task(f"文件仍在写入，延迟处理: {p.name}", "warning")
                     _add_pending(archive_path, watch_dir_id)
-                    return
+                    return  # finally 块会正确释放 sem
             except Exception:
-                return
+                return  # finally 块会正确释放 sem
 
         log_task(f"开始解压: {Path(archive_path).name}", "info")
         t_start = time.time()
@@ -676,13 +697,27 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                     if watch_dir_id > 0:
                         _maybe_auto_delete(archive_path, watch_dir_id)
                 else:
+                    is_all_pw_failed = "all passwords" in result.error.lower() or "所有密码" in result.error
                     conn.execute(
                         """UPDATE archive_history SET status='failed', error_message=?,
-                           duration_seconds=?, completed_at=datetime('now','localtime') WHERE id=?""",
-                        (result.error, duration, history_id)
+                           duration_seconds=?, completed_at=datetime('now','localtime'),
+                           all_passwords_failed=? WHERE id=?""",
+                        (result.error, duration, 1 if is_all_pw_failed else 0, history_id)
                     )
+                    if is_all_pw_failed:
+                        # 密码全失败，永久标记为 done，避免重复扫描浪费资源
+                        conn.execute(
+                            "INSERT OR IGNORE INTO failed_permanent (file_path, archive_id) VALUES (?,?)",
+                            (archive_path, history_id)
+                        )
+                        conn.execute(
+                            "INSERT OR IGNORE INTO done_files (file_path, archive_id) VALUES (?,?)",
+                            (archive_path, history_id)
+                        )
+                        log_task(f"解压失败(密码耗尽，已永久记录): {Path(archive_path).name} — {result.error}", "warning")
                     conn.commit()
-                    log_task(f"解压失败: {Path(archive_path).name} — {result.error}", "error")
+                    if not is_all_pw_failed:
+                        log_task(f"解压失败: {Path(archive_path).name} — {result.error}", "error")
             finally:
                 conn.close()
     except Exception as e:
@@ -718,6 +753,16 @@ def _add_pending(file_path: str, watch_dir_id: int):
                 conn.close()
     except:
         pass
+
+def _cleanup_pending(file_path: str):
+    """清除指定文件的 pending 记录（入队前调用，避免脏数据）"""
+    with db_lock:
+        conn = get_db()
+        try:
+            conn.execute("DELETE FROM pending_files WHERE file_path=?", (file_path,))
+            conn.commit()
+        finally:
+            conn.close()
 
 def _maybe_auto_delete(archive_path: str, watch_dir_id: int):
     conn = get_db()
@@ -1157,12 +1202,13 @@ def retry_history(hid: int):
     if not row:
         raise HTTPException(404, "记录不存在")
     archive_path = row[0]
-    # Remove from done_files so it can be re-processed
     with db_lock:
         conn = get_db()
         try:
             conn.execute("DELETE FROM done_files WHERE file_path=?", (archive_path,))
-            conn.execute("UPDATE archive_history SET status='pending' WHERE id=?", (hid,))
+            conn.execute("DELETE FROM failed_permanent WHERE file_path=?", (archive_path,))
+            conn.execute("DELETE FROM pending_files WHERE file_path=?", (archive_path,))
+            conn.execute("UPDATE archive_history SET status='pending', all_passwords_failed=0 WHERE id=?", (hid,))
             conn.commit()
             wd = conn.execute(
                 "SELECT wd.id, wd.output_path FROM watch_dirs wd WHERE wd.enabled=1 AND ? LIKE wd.watch_path || '%' LIMIT 1",
@@ -1233,6 +1279,9 @@ def update_settings(data: dict):
             conn.commit()
         finally:
             conn.close()
+    # concurrent_tasks 变更时立即刷新 semaphore
+    if "concurrent_tasks" in data:
+        get_semaphore(refresh=True)
     return {"ok": True}
 
 # ============== API: Logs ==============
