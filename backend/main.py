@@ -1,6 +1,7 @@
 """
 ArchiveMate v2 - 智能自动解压服务（重构版）
 """
+
 import os
 import sys
 import re
@@ -10,15 +11,25 @@ import json
 import time
 import threading
 import subprocess
+import shutil
 from datetime import datetime, timezone
+
 
 def now_local() -> str:
     """返回本地时间字符串"""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    BackgroundTasks,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -43,23 +54,30 @@ _SEVENZIP_CANDIDATES = [
     "/usr/bin/7z",
 ]
 
+
 def _find_sevenzip() -> str:
     for p in _SEVENZIP_CANDIDATES:
         if p and Path(p).exists():
             return p
     return "7z"
 
+
 SEVENZZ_PATH = _find_sevenzip()
+START_TIME = time.time()
+
 
 # ============== 日志 ==============
 class _LocalTimeFormatter(logging.Formatter):
     """使用本地时间而非 UTC 格式化日志时间"""
+
     def formatTime(self, record, datefmt=None):
         import time as _time
+
         ct = _time.localtime(record.created)
         if datefmt:
             return _time.strftime(datefmt, ct)
         return _time.strftime("%Y-%m-%d %H:%M:%S", ct)
+
 
 _log_fmt = _LocalTimeFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 _file_handler = logging.FileHandler(LOGS_DIR / "archivemate.log")
@@ -72,13 +90,15 @@ logger = logging.getLogger("archivemate")
 # ============== 数据库 ==============
 db_lock = threading.RLock()  # 可重入锁，防止同一线程嵌套 acquire 死锁
 
+
 def get_db():
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # WAL 模式允许读写并发
+    conn.execute("PRAGMA journal_mode=WAL")  # WAL 模式允许读写并发
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=10000")  # 10秒等待
     return conn
+
 
 def init_db():
     with db_lock:
@@ -165,6 +185,7 @@ def init_db():
                 ('stability_wait', '5'),
                 ('concurrent_tasks', '2'),
                 ('sevenzip_path', '/usr/local/bin/7zzs'),
+                ('log_retention_days', '7'),
                 ('password_dict', 'password\n123456\n12345678\nqwerty\nadmin\n000000\n111111\n123123\n123456789\n1234567890\nabc123\n')
             """)
             # 服务重启：将遗留的 processing 记录重置为 failed
@@ -175,6 +196,28 @@ def init_db():
         finally:
             conn.close()
 
+
+def cleanup_old_logs():
+    """清理过期的日志记录"""
+    try:
+        days = int(get_setting("log_retention_days", "7"))
+        with db_lock:
+            conn = get_db()
+            try:
+                result = conn.execute(
+                    "DELETE FROM task_logs WHERE created_at < datetime('now', ? || ' days')",
+                    (f"-{days}",),
+                )
+                deleted = result.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"已清理 {deleted} 条过期日志（保留 {days} 天）")
+            finally:
+                conn.close()
+    except Exception as e:
+        logger.error(f"清理日志失败: {e}")
+
+
 def get_setting(key: str, default: str = "") -> str:
     conn = get_db()
     try:
@@ -182,6 +225,7 @@ def get_setting(key: str, default: str = "") -> str:
         return row[0] if row else default
     finally:
         conn.close()
+
 
 def get_sevenzip_path() -> str:
     env_path = os.environ.get("SEVENZIP_PATH", "")
@@ -195,45 +239,67 @@ def get_sevenzip_path() -> str:
 
 # ============== 压缩包识别 ==============
 ARCHIVE_EXTENSIONS = {
-    '.zip', '.7z', '.rar', '.tar', '.gz', '.bz2', '.xz',
-    '.tgz', '.tbz2', '.txz',
-    '.z01', '.001',
+    ".zip",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".tgz",
+    ".tbz2",
+    ".txz",
+    ".z01",
+    ".001",
 }
+
 
 def is_archive(path: str) -> bool:
     p = Path(path)
     name = p.name
     name_lower = name.lower()
-    if name.startswith('.') or name_lower.endswith('.tmp') or name_lower.endswith('.crdownload') or name_lower.endswith('.download') or name_lower.endswith('.part'):
+    if (
+        name.startswith(".")
+        or name_lower.endswith(".tmp")
+        or name_lower.endswith(".crdownload")
+        or name_lower.endswith(".download")
+        or name_lower.endswith(".part")
+    ):
         return False
     ext = p.suffix.lower()
     if ext in ARCHIVE_EXTENSIONS:
         return True
     # tar.gz, tar.bz2, tar.xz
-    if name_lower.endswith('.tar.gz') or name_lower.endswith('.tar.bz2') or name_lower.endswith('.tar.xz'):
+    if (
+        name_lower.endswith(".tar.gz")
+        or name_lower.endswith(".tar.bz2")
+        or name_lower.endswith(".tar.xz")
+    ):
         return True
     # .rar (包括 .part1.rar)
-    if name_lower.endswith('.rar'):
+    if name_lower.endswith(".rar"):
         return True
     return False
+
 
 def is_volume_secondary(path: str) -> bool:
     """判断是否是非首个分卷文件（需跳过）"""
     name = Path(path).name.lower()
     # .z02, .z03... (not .z01)
-    if re.match(r'.*\.z\d{2}$', name) and not name.endswith('.z01'):
+    if re.match(r".*\.z\d{2}$", name) and not name.endswith(".z01"):
         return True
     # .part2.rar, .part02.rar (number > 1)
-    m = re.search(r'\.part0*(\d+)\.rar$', name)
+    m = re.search(r"\.part0*(\d+)\.rar$", name)
     if m and int(m.group(1)) > 1:
         return True
     # .002, .003... (not .001)
-    if re.match(r'.*\.\d{3,}$', name) and not re.search(r'\.0+1$', name):
+    if re.match(r".*\.\d{3,}$", name) and not re.search(r"\.0+1$", name):
         return True
     # .rar.002, .rar.003...
-    if re.match(r'.*\.rar\.\d{3,}$', name) and not name.endswith('.rar.001'):
+    if re.match(r".*\.rar\.\d{3,}$", name) and not name.endswith(".rar.001"):
         return True
     return False
+
 
 def get_sibling_volumes(path: str) -> List[str]:
     """返回与主卷同属一套分卷的所有文件路径（包括主卷本身），找不到规律返回空列表"""
@@ -243,9 +309,9 @@ def get_sibling_volumes(path: str) -> List[str]:
     volumes = []
 
     # .7z.001 / .zip.001 / .rar.001 / .001 系列
-    m = re.match(r'^(.*?)\.(\w+)\.0+1$', name_lower)
+    m = re.match(r"^(.*?)\.(\w+)\.0+1$", name_lower)
     if m:
-        base_name = p.name[:m.end(1)]  # 保持原始大小写
+        base_name = p.name[: m.end(1)]  # 保持原始大小写
         ext = m.group(2)
         i = 1
         while True:
@@ -258,14 +324,14 @@ def get_sibling_volumes(path: str) -> List[str]:
         return volumes
 
     # .part01.rar / .part1.rar 系列
-    m2 = re.search(r'(\.part0*1\.rar)$', name_lower)
+    m2 = re.search(r"(\.part0*1\.rar)$", name_lower)
     if m2:
-        prefix = p.name[:len(p.name) - len(m2.group(1))]
+        prefix = p.name[: len(p.name) - len(m2.group(1))]
         i = 1
         while True:
             # try both .part1.rar and .part01.rar style
             found = False
-            for fmt in [f'.part{i}.rar', f'.part{i:02d}.rar', f'.part{i:03d}.rar']:
+            for fmt in [f".part{i}.rar", f".part{i:02d}.rar", f".part{i:03d}.rar"]:
                 cand = parent / (prefix + fmt)
                 if cand.exists():
                     volumes.append(str(cand))
@@ -277,7 +343,7 @@ def get_sibling_volumes(path: str) -> List[str]:
         return volumes
 
     # .z01 系列
-    if name_lower.endswith('.z01'):
+    if name_lower.endswith(".z01"):
         base_name = p.name[:-4]  # 去掉 .z01
         volumes.append(str(p))
         i = 2
@@ -291,6 +357,7 @@ def get_sibling_volumes(path: str) -> List[str]:
         return volumes
 
     return []
+
 
 def all_volumes_stable(archive_path: str, stability_wait: int = 3) -> bool:
     """检查分卷压缩的所有分卷文件是否都已下载完成（稳定）"""
@@ -306,12 +373,17 @@ def all_volumes_stable(archive_path: str, stability_wait: int = 3) -> bool:
             s1 = vp.stat()
             time.sleep(stability_wait)
             s2 = vp.stat()
-            if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
+            if (
+                s1.st_size != s2.st_size
+                or s1.st_mtime != s2.st_mtime
+                or s2.st_size == 0
+            ):
                 logger.info(f"分卷仍在写入: {vp.name}")
                 return False
         except Exception:
             return False
     return True
+
 
 def is_file_stable(path: str, wait_seconds: int = 5) -> bool:
     """检测文件是否稳定（未在下载中）"""
@@ -326,6 +398,7 @@ def is_file_stable(path: str, wait_seconds: int = 5) -> bool:
     except:
         return False
 
+
 def is_quick_stable(path: str) -> bool:
     """快速检测（不等待），基于文件大小"""
     p = Path(path)
@@ -334,15 +407,20 @@ def is_quick_stable(path: str) -> bool:
     except:
         return False
 
+
 def get_all_passwords() -> List[str]:
     conn = get_db()
     try:
-        rows = conn.execute("SELECT password FROM passwords ORDER BY hit_count DESC").fetchall()
+        rows = conn.execute(
+            "SELECT password FROM passwords ORDER BY hit_count DESC"
+        ).fetchall()
         custom = [r[0] for r in rows]
-        dict_val = conn.execute("SELECT value FROM settings WHERE key='password_dict'").fetchone()
+        dict_val = conn.execute(
+            "SELECT value FROM settings WHERE key='password_dict'"
+        ).fetchone()
         dict_passwords = []
         if dict_val:
-            dict_passwords = [p.strip() for p in dict_val[0].split('\n') if p.strip()]
+            dict_passwords = [p.strip() for p in dict_val[0].split("\n") if p.strip()]
         # custom passwords first (higher hit rate), then dict
         seen = set()
         result = []
@@ -354,16 +432,25 @@ def get_all_passwords() -> List[str]:
     finally:
         conn.close()
 
+
 # ============== 解压引擎 ==============
 class ExtractionResult:
-    def __init__(self, success: bool, output_path: str = "", error: str = "",
-                 password_used: str = "", file_count: int = 0, extracted_size: int = 0):
+    def __init__(
+        self,
+        success: bool,
+        output_path: str = "",
+        error: str = "",
+        password_used: str = "",
+        file_count: int = 0,
+        extracted_size: int = 0,
+    ):
         self.success = success
         self.output_path = output_path
         self.error = error
         self.password_used = password_used
         self.file_count = file_count
         self.extracted_size = extracted_size
+
 
 class ArchiveExtractor:
     def __init__(self, archive_path: str, output_dir: str, passwords: List[str] = None):
@@ -376,21 +463,21 @@ class ArchiveExtractor:
         name_lower = self.archive_path.name.lower()
         parent = self.archive_path.parent
         # .z01 -> look for .zip
-        if name_lower.endswith('.z01'):
+        if name_lower.endswith(".z01"):
             base = self.archive_path.stem
-            for ext in ['.zip', '.ZIP']:
+            for ext in [".zip", ".ZIP"]:
                 cand = parent / (base + ext)
                 if cand.exists():
                     return cand
             return self.archive_path
         # .part01.rar / .part1.rar -> use as-is (7z handles it)
-        if re.search(r'\.part0*1\.rar$', name_lower):
+        if re.search(r"\.part0*1\.rar$", name_lower):
             return self.archive_path
         # .rar.001 -> use as-is
-        if name_lower.endswith('.rar.001'):
+        if name_lower.endswith(".rar.001"):
             return self.archive_path
         # .001 -> use as-is (7z handles multi-volume)
-        if name_lower.endswith('.001'):
+        if name_lower.endswith(".001"):
             return self.archive_path
         return self.archive_path
 
@@ -398,49 +485,61 @@ class ArchiveExtractor:
         primary = self._get_primary_archive()
         stem = primary.stem
         # Strip common suffixes from stem for output dir name
-        for suffix in ['.part01', '.part001', '.part1', '.rar']:
+        for suffix in [".part01", ".part001", ".part1", ".rar"]:
             if stem.lower().endswith(suffix):
-                stem = stem[:len(stem)-len(suffix)]
+                stem = stem[: len(stem) - len(suffix)]
                 break
         output_subdir = self.output_dir / stem
         output_subdir.mkdir(parents=True, exist_ok=True)
 
         sz_path = get_sevenzip_path()
-        cmd = [sz_path, 'x', str(primary), f'-o{output_subdir}', '-y', '-sccUTF-8']
+        cmd = [sz_path, "x", str(primary), f"-o{output_subdir}", "-y", "-sccUTF-8"]
         # 始终传入 -p 参数（即使为空），避免 Rar5 加密文件等待交互式密码输入卡死
-        cmd.append(f'-p{password}')
+        cmd.append(f"-p{password}")
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=3600,
-                stdin=subprocess.DEVNULL
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600,
+                stdin=subprocess.DEVNULL,
             )
             stdout = result.stdout + result.stderr
             stdout_lower = stdout.lower()
 
             # 密码错误的各种表现
-            if 'wrong password' in stdout_lower:
+            if "wrong password" in stdout_lower:
                 return ExtractionResult(False, error="wrong password")
-            if 'enter password' in stdout_lower:
+            if "enter password" in stdout_lower:
                 return ExtractionResult(False, error="wrong password")
-            if result.returncode == 2 and ('encrypted' in stdout_lower or 'password' in stdout_lower):
+            if result.returncode == 2 and (
+                "encrypted" in stdout_lower or "password" in stdout_lower
+            ):
                 return ExtractionResult(False, error="wrong password")
 
-            extracted_files = [f for f in output_subdir.rglob('*') if f.is_file()]
+            extracted_files = [f for f in output_subdir.rglob("*") if f.is_file()]
             total_size = sum(f.stat().st_size for f in extracted_files)
 
-            if result.returncode == 0 or 'everything is ok' in stdout_lower:
+            if result.returncode == 0 or "everything is ok" in stdout_lower:
                 if total_size > 0 or len(extracted_files) > 0:
                     return ExtractionResult(
-                        True, str(output_subdir),
+                        True,
+                        str(output_subdir),
                         password_used=password,
                         file_count=len(extracted_files),
-                        extracted_size=total_size
+                        extracted_size=total_size,
                     )
                 else:
-                    return ExtractionResult(False, error="wrong password (empty output)")
+                    return ExtractionResult(
+                        False, error="wrong password (empty output)"
+                    )
 
-            err = stdout.strip()[:500] if stdout.strip() else f"returncode={result.returncode}"
+            err = (
+                stdout.strip()[:500]
+                if stdout.strip()
+                else f"returncode={result.returncode}"
+            )
             return ExtractionResult(False, error=err)
         except subprocess.TimeoutExpired:
             return ExtractionResult(False, error="解压超时（1小时）")
@@ -464,14 +563,19 @@ class ArchiveExtractor:
             if "wrong password" not in r.error.lower():
                 return r
 
-        return ExtractionResult(False, error=f"所有密码均失败（{len(self.passwords)}个）")
+        return ExtractionResult(
+            False, error=f"所有密码均失败（{len(self.passwords)}个）"
+        )
 
     def _bump_password_hit(self, pwd: str):
         try:
             with db_lock:
                 conn = get_db()
                 try:
-                    conn.execute("UPDATE passwords SET hit_count=hit_count+1 WHERE password=?", (pwd,))
+                    conn.execute(
+                        "UPDATE passwords SET hit_count=hit_count+1 WHERE password=?",
+                        (pwd,),
+                    )
                     conn.commit()
                 finally:
                     conn.close()
@@ -484,6 +588,7 @@ class ArchiveExtractor:
 _ws_subscribers: list = []  # list of asyncio.Queue
 _ws_subscribers_lock = threading.Lock()
 
+
 def log_task(message: str, level: str = "info", task_id: str = ""):
     logger.info(f"[{level.upper()}] {message}")
     try:
@@ -492,7 +597,7 @@ def log_task(message: str, level: str = "info", task_id: str = ""):
             try:
                 conn.execute(
                     "INSERT INTO task_logs (level, message, task_id) VALUES (?,?,?)",
-                    (level, message, task_id)
+                    (level, message, task_id),
                 )
                 conn.commit()
             finally:
@@ -500,7 +605,11 @@ def log_task(message: str, level: str = "info", task_id: str = ""):
     except:
         pass
     # Broadcast to all WS clients (each has own queue)
-    payload = {"level": level, "message": message, "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    payload = {
+        "level": level,
+        "message": message,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
     with _ws_subscribers_lock:
         for q in list(_ws_subscribers):
             try:
@@ -508,29 +617,72 @@ def log_task(message: str, level: str = "info", task_id: str = ""):
             except:
                 pass
 
+
 # ============== 任务处理 ==============
 processing_files: set = set()
 processing_lock = threading.Lock()
-_semaphore: threading.Semaphore = None
 
-def get_semaphore(refresh: bool = False) -> threading.Semaphore:
+
+class AdjustableSemaphore:
+    """可动态调整容量的信号量 — 所有线程共享同一实例，不会因 refresh 泄漏 permit"""
+    def __init__(self, limit: int = 2):
+        self._cond = threading.Condition(threading.Lock())
+        self._limit = limit
+        self._value = limit
+
+    def acquire(self, blocking: bool = True):
+        with self._cond:
+            while self._value <= 0:
+                if not blocking:
+                    return False
+                self._cond.wait()
+            self._value -= 1
+            return True
+
+    def release(self):
+        with self._cond:
+            if self._value < self._limit:
+                self._value += 1
+                self._cond.notify()
+
+    def set_limit(self, new_limit: int):
+        with self._cond:
+            old = self._limit
+            self._limit = new_limit
+            if new_limit > old:
+                for _ in range(new_limit - old):
+                    self._cond.notify()
+
+_semaphore: AdjustableSemaphore = None
+
+
+def get_semaphore(refresh: bool = False) -> AdjustableSemaphore:
     global _semaphore
-    if _semaphore is None or refresh:
+    if _semaphore is None:
         n = int(get_setting("concurrent_tasks", "2"))
-        _semaphore = threading.Semaphore(n)
+        _semaphore = AdjustableSemaphore(n)
+    elif refresh:
+        n = int(get_setting("concurrent_tasks", "2"))
+        _semaphore.set_limit(n)
     return _semaphore
+
 
 def is_done(file_path: str) -> bool:
     """检查文件是否已处理完成（成功 or 密码耗尽永久跳过）"""
     conn = get_db()
     try:
-        row = conn.execute("SELECT id FROM done_files WHERE file_path=?", (file_path,)).fetchone()
+        row = conn.execute(
+            "SELECT id FROM done_files WHERE file_path=?", (file_path,)
+        ).fetchone()
         if row is not None:
             return True
-        row2 = conn.execute("SELECT id FROM failed_permanent WHERE file_path=?", (file_path,)).fetchone()
+        row2 = conn.execute(
+            "SELECT id FROM failed_permanent WHERE file_path=?", (file_path,)
+        ).fetchone()
         return row2 is not None
     finally:
         conn.close()
+
 
 def queue_archive(archive_path: str, watch_dir_id: int, output_path: str):
     """入队处理一个压缩包，跳过已完成的和次分卷"""
@@ -545,7 +697,10 @@ def queue_archive(archive_path: str, watch_dir_id: int, output_path: str):
         processing_files.add(archive_path)
     # 清除该文件可能遗留的 pending 记录（上次处理失败留下的脏数据）
     _cleanup_pending(archive_path)
-    threading.Thread(target=_worker, args=(archive_path, watch_dir_id, output_path), daemon=True).start()
+    threading.Thread(
+        target=_worker, args=(archive_path, watch_dir_id, output_path), daemon=True
+    ).start()
+
 
 def _worker(archive_path: str, watch_dir_id: int, output_path: str):
     sem = get_semaphore()
@@ -559,9 +714,9 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
             # 策略：只要文件还在变化（下载中）就一直等；
             # 若某个分卷连续 STALL_ROUNDS 次检查大小/mtime 都没变化且文件不存在，才认为失败放弃。
             # 已存在且稳定的分卷不重复计入 stall。
-            POLL_INTERVAL = 30        # 每30秒检查一次
-            STALL_ROUNDS   = 20       # 连续10分钟无任何进展才放弃（20 * 30s）
-            stall_counter  = 0
+            POLL_INTERVAL = 30  # 每30秒检查一次
+            STALL_ROUNDS = 20  # 连续10分钟无任何进展才放弃（20 * 30s）
+            stall_counter = 0
             prev_snapshot: dict = {}  # vol_path -> (size, mtime)
 
             while True:
@@ -586,22 +741,26 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                         unstable.append(Path(vol).name)  # 还在写入
 
                 if missing:
-                    names = ', '.join(Path(v).name for v in missing)
+                    names = ", ".join(Path(v).name for v in missing)
                     log_task(f"等待分卷: {names} (共{len(volumes)}个)", "info")
                     stall_counter = 0  # 还有文件没出现，重置 stall
                 elif unstable:
-                    names = ', '.join(unstable)
+                    names = ", ".join(unstable)
                     log_task(f"分卷下载中: {names}", "info")
                     stall_counter = 0  # 有进展，重置 stall
                 else:
                     # 所有分卷存在且本轮快照与上轮一致 → 稳定
-                    log_task(f"所有分卷就绪，开始解压: {Path(archive_path).name}", "info")
+                    log_task(
+                        f"所有分卷就绪，开始解压: {Path(archive_path).name}", "info"
+                    )
                     break
 
                 prev_snapshot = cur_snapshot
                 stall_counter += 1
                 if stall_counter >= STALL_ROUNDS:
-                    log_task(f"分卷长时间无进展，放弃: {Path(archive_path).name}", "warning")
+                    log_task(
+                        f"分卷长时间无进展，放弃: {Path(archive_path).name}", "warning"
+                    )
                     _add_pending(archive_path, watch_dir_id)
                     # 必须重新 acquire 平衡 semaphore，否则会泄漏
                     sem = get_semaphore(refresh=True)
@@ -629,7 +788,11 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                 sem = get_semaphore(refresh=True)  # 重新读取 concurrent_tasks 设置
                 sem.acquire()
                 s2 = p.stat()
-                if s1.st_size != s2.st_size or s1.st_mtime != s2.st_mtime or s2.st_size == 0:
+                if (
+                    s1.st_size != s2.st_size
+                    or s1.st_mtime != s2.st_mtime
+                    or s2.st_size == 0
+                ):
                     log_task(f"文件仍在写入，延迟处理: {p.name}", "warning")
                     _add_pending(archive_path, watch_dir_id)
                     return  # finally 块会正确释放 sem
@@ -640,23 +803,28 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
         t_start = time.time()
 
         # 创建历史记录
-        file_size = Path(archive_path).stat().st_size if Path(archive_path).exists() else 0
+        file_size = (
+            Path(archive_path).stat().st_size if Path(archive_path).exists() else 0
+        )
         with db_lock:
             conn = get_db()
             try:
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO archive_history (original_path, status, file_size) VALUES (?,?,?)",
-                    (archive_path, 'processing', file_size)
+                    (archive_path, "processing", file_size),
                 )
                 conn.commit()
                 if cur.lastrowid == 0:
                     # Already exists (INSERT OR IGNORE skipped), reset status to processing
                     conn.execute(
                         "UPDATE archive_history SET status='processing', completed_at=NULL, error_message=NULL WHERE original_path=?",
-                        (archive_path,)
+                        (archive_path,),
                     )
                     conn.commit()
-                    row = conn.execute("SELECT id FROM archive_history WHERE original_path=? ORDER BY id DESC LIMIT 1", (archive_path,)).fetchone()
+                    row = conn.execute(
+                        "SELECT id FROM archive_history WHERE original_path=? ORDER BY id DESC LIMIT 1",
+                        (archive_path,),
+                    ).fetchone()
                     history_id = row[0] if row else None
                 else:
                     history_id = cur.lastrowid
@@ -678,46 +846,76 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
                         """UPDATE archive_history SET status='success', output_path=?, password_used=?,
                            extracted_size=?, file_count=?, duration_seconds=?, completed_at=datetime('now','localtime')
                            WHERE id=?""",
-                        (result.output_path, result.password_used, result.extracted_size,
-                         result.file_count, duration, history_id)
+                        (
+                            result.output_path,
+                            result.password_used,
+                            result.extracted_size,
+                            result.file_count,
+                            duration,
+                            history_id,
+                        ),
                     )
                     conn.execute(
                         "INSERT OR IGNORE INTO done_files (file_path, archive_id) VALUES (?,?)",
-                        (archive_path, history_id)
+                        (archive_path, history_id),
                     )
                     conn.commit()
-                    log_task(f"解压成功: {Path(archive_path).name} → {result.output_path} ({result.file_count}个文件, {round(duration,1)}s)", "info")
+                    log_task(
+                        f"解压成功: {Path(archive_path).name} → {result.output_path} ({result.file_count}个文件, {round(duration, 1)}s)",
+                        "info",
+                    )
                     # 深层解压
                     threading.Thread(
                         target=deep_extract,
                         args=(result.output_path, output_path, 1),
-                        daemon=True
+                        daemon=True,
                     ).start()
                     # 自动删除
                     if watch_dir_id > 0:
                         _maybe_auto_delete(archive_path, watch_dir_id)
                 else:
-                    is_all_pw_failed = "all passwords" in result.error.lower() or "所有密码" in result.error
+                    is_all_pw_failed = (
+                        "all passwords" in result.error.lower()
+                        or "所有密码" in result.error
+                    )
+                    is_corrupt = (
+                        "can't open as archive" in result.error.lower()
+                        or "无法作为压缩包打开" in result.error
+                        or "unexpected end of archive" in result.error.lower()
+                        or "数据错误" in result.error
+                        or "crc failed" in result.error.lower()
+                    )
+                    is_permanent_fail = is_all_pw_failed or is_corrupt
                     conn.execute(
                         """UPDATE archive_history SET status='failed', error_message=?,
                            duration_seconds=?, completed_at=datetime('now','localtime'),
                            all_passwords_failed=? WHERE id=?""",
-                        (result.error, duration, 1 if is_all_pw_failed else 0, history_id)
+                        (
+                            result.error,
+                            duration,
+                            1 if is_permanent_fail else 0,
+                            history_id,
+                        ),
                     )
-                    if is_all_pw_failed:
-                        # 密码全失败，永久标记为 done，避免重复扫描浪费资源
+                    if is_permanent_fail:
                         conn.execute(
                             "INSERT OR IGNORE INTO failed_permanent (file_path, archive_id) VALUES (?,?)",
-                            (archive_path, history_id)
+                            (archive_path, history_id),
                         )
                         conn.execute(
                             "INSERT OR IGNORE INTO done_files (file_path, archive_id) VALUES (?,?)",
-                            (archive_path, history_id)
+                            (archive_path, history_id),
                         )
-                        log_task(f"解压失败(密码耗尽，已永久记录): {Path(archive_path).name} — {result.error}", "warning")
+                        log_task(
+                            f"解压失败(已永久记录): {Path(archive_path).name} — {result.error}",
+                            "warning",
+                        )
                     conn.commit()
-                    if not is_all_pw_failed:
-                        log_task(f"解压失败: {Path(archive_path).name} — {result.error}", "error")
+                    if not is_permanent_fail:
+                        log_task(
+                            f"解压失败: {Path(archive_path).name} — {result.error}",
+                            "error",
+                        )
             finally:
                 conn.close()
     except Exception as e:
@@ -727,7 +925,10 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
             with db_lock:
                 conn = get_db()
                 try:
-                    conn.execute("UPDATE archive_history SET status='failed', error_message=?, completed_at=datetime('now','localtime') WHERE id=?", (str(e), history_id))
+                    conn.execute(
+                        "UPDATE archive_history SET status='failed', error_message=?, completed_at=datetime('now','localtime') WHERE id=?",
+                        (str(e), history_id),
+                    )
                     conn.commit()
                 finally:
                     conn.close()
@@ -735,6 +936,7 @@ def _worker(archive_path: str, watch_dir_id: int, output_path: str):
         sem.release()
         with processing_lock:
             processing_files.discard(archive_path)
+
 
 def _add_pending(file_path: str, watch_dir_id: int):
     p = Path(file_path)
@@ -746,13 +948,14 @@ def _add_pending(file_path: str, watch_dir_id: int):
                 conn.execute(
                     """INSERT OR REPLACE INTO pending_files (file_path, watch_dir_id, last_size, last_mtime)
                        VALUES (?,?,?,?)""",
-                    (file_path, watch_dir_id, stat.st_size, stat.st_mtime)
+                    (file_path, watch_dir_id, stat.st_size, stat.st_mtime),
                 )
                 conn.commit()
             finally:
                 conn.close()
     except:
         pass
+
 
 def _cleanup_pending(file_path: str):
     """清除指定文件的 pending 记录（入队前调用，避免脏数据）"""
@@ -764,10 +967,14 @@ def _cleanup_pending(file_path: str):
         finally:
             conn.close()
 
+
 def _maybe_auto_delete(archive_path: str, watch_dir_id: int):
     conn = get_db()
     try:
-        row = conn.execute("SELECT auto_delete, output_path FROM watch_dirs WHERE id=?", (watch_dir_id,)).fetchone()
+        row = conn.execute(
+            "SELECT auto_delete, output_path FROM watch_dirs WHERE id=?",
+            (watch_dir_id,),
+        ).fetchone()
     finally:
         conn.close()
     if row and row[0]:
@@ -776,6 +983,7 @@ def _maybe_auto_delete(archive_path: str, watch_dir_id: int):
             log_task(f"已删除原压缩包: {Path(archive_path).name}", "info")
         except Exception as e:
             log_task(f"删除原文件失败: {e}", "warning")
+
 
 def deep_extract(directory: str, root_output: str, depth: int = 1):
     """递归处理解压出来的压缩包 — 只扫本次解压的子目录，不递归扫全部输出目录"""
@@ -787,7 +995,11 @@ def deep_extract(directory: str, root_output: str, depth: int = 1):
         return
     # 只遍历当前目录一层，对压缩包文件排队，对子目录再递归
     for item in dir_path.iterdir():
-        if item.is_file() and is_archive(str(item)) and not is_volume_secondary(str(item)):
+        if (
+            item.is_file()
+            and is_archive(str(item))
+            and not is_volume_secondary(str(item))
+        ):
             if not is_done(str(item)):
                 # 子压缩包解压到同目录下
                 queue_archive(str(item), 0, str(dir_path))
@@ -846,18 +1058,24 @@ class ArchiveWatcher:
                 pass
             logger.info(f"停止监控 id={watch_dir_id}")
 
+
 watcher = ArchiveWatcher()
+
 
 # ============== 定时扫描 ==============
 def periodic_scan():
+    scan_count = 0
     while True:
         interval = int(get_setting("check_interval", "60"))
         time.sleep(interval)
+        scan_count += 1
         try:
             with db_lock:
                 conn = get_db()
                 try:
-                    rows = conn.execute("SELECT id, watch_path, output_path FROM watch_dirs WHERE enabled=1").fetchall()
+                    rows = conn.execute(
+                        "SELECT id, watch_path, output_path FROM watch_dirs WHERE enabled=1"
+                    ).fetchall()
                 finally:
                     conn.close()
             for row in rows:
@@ -865,8 +1083,11 @@ def periodic_scan():
                 _scan_dir(wid, watch_path, output_path)
             # 检查 pending 队列
             _check_pending()
+            if scan_count % 10 == 0:
+                cleanup_old_logs()
         except Exception as e:
             logger.error(f"定时扫描异常: {e}")
+
 
 def _scan_dir(wid: int, watch_path: str, output_path: str):
     p = Path(watch_path)
@@ -880,15 +1101,22 @@ def _scan_dir(wid: int, watch_path: str, output_path: str):
             continue  # item is inside output_path, skip
         except ValueError:
             pass
-        if item.is_file() and is_archive(str(item)) and not is_volume_secondary(str(item)):
+        if (
+            item.is_file()
+            and is_archive(str(item))
+            and not is_volume_secondary(str(item))
+        ):
             if not is_done(str(item)):
                 queue_archive(str(item), wid, output_path)
+
 
 def _check_pending():
     """检查等待队列中的文件是否稳定了"""
     conn = get_db()
     try:
-        rows = conn.execute("SELECT id, file_path, watch_dir_id, last_size, last_mtime FROM pending_files").fetchall()
+        rows = conn.execute(
+            "SELECT id, file_path, watch_dir_id, last_size, last_mtime FROM pending_files"
+        ).fetchall()
     finally:
         conn.close()
 
@@ -911,11 +1139,17 @@ def _check_pending():
                 continue
         try:
             stat = p.stat()
-            if stat.st_size == last_size and stat.st_mtime == last_mtime and stat.st_size > 0:
+            if (
+                stat.st_size == last_size
+                and stat.st_mtime == last_mtime
+                and stat.st_size > 0
+            ):
                 # File is stable — look up output path
                 conn = get_db()
                 try:
-                    wd = conn.execute("SELECT output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
+                    wd = conn.execute(
+                        "SELECT output_path FROM watch_dirs WHERE id=?", (wid,)
+                    ).fetchone()
                 finally:
                     conn.close()
                 output_path = wd[0] if wd else str(BASE_DIR / "extracted")
@@ -948,8 +1182,10 @@ def _check_pending():
                 with db_lock:
                     conn = get_db()
                     try:
-                        conn.execute("UPDATE pending_files SET last_size=?, last_mtime=? WHERE id=?",
-                                     (stat.st_size, stat.st_mtime, pid))
+                        conn.execute(
+                            "UPDATE pending_files SET last_size=?, last_mtime=? WHERE id=?",
+                            (stat.st_size, stat.st_mtime, pid),
+                        )
                         conn.commit()
                     finally:
                         conn.close()
@@ -957,11 +1193,14 @@ def _check_pending():
         except Exception as e:
             logger.warning(f"_check_pending 异常: {p.name} — {e}")
 
+
 def restore_watchers():
     time.sleep(2)
     conn = get_db()
     try:
-        rows = conn.execute("SELECT id, watch_path, output_path FROM watch_dirs WHERE enabled=1").fetchall()
+        rows = conn.execute(
+            "SELECT id, watch_path, output_path FROM watch_dirs WHERE enabled=1"
+        ).fetchall()
     finally:
         conn.close()
     for row in rows:
@@ -971,15 +1210,21 @@ def restore_watchers():
 # ============== FastAPI App ==============
 app = FastAPI(title="ArchiveMate", version="2.0.0")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
 
 @app.on_event("startup")
 def startup():
     init_db()
+    cleanup_old_logs()
     threading.Thread(target=periodic_scan, daemon=True).start()
     threading.Thread(target=restore_watchers, daemon=True).start()
+
 
 # ============== Pydantic 模型 ==============
 class WatchDirCreate(BaseModel):
@@ -987,6 +1232,13 @@ class WatchDirCreate(BaseModel):
     output_path: str
     enabled: bool = True
     auto_delete: bool = False
+
+
+class WatchDirUpdate(BaseModel):
+    watch_path: Optional[str] = None
+    output_path: Optional[str] = None
+    auto_delete: Optional[bool] = None
+
 
 class WatchDirOut(BaseModel):
     id: int
@@ -996,9 +1248,11 @@ class WatchDirOut(BaseModel):
     auto_delete: bool
     created_at: str
 
+
 class PasswordCreate(BaseModel):
     password: str
     tag: str = ""
+
 
 class PasswordOut(BaseModel):
     id: int
@@ -1007,12 +1261,14 @@ class PasswordOut(BaseModel):
     hit_count: int
     created_at: str
 
+
 class LogOut(BaseModel):
     id: int
     level: str
     message: str
     task_id: Optional[str] = ""
     created_at: str
+
 
 class HistoryItem(BaseModel):
     id: int
@@ -1028,11 +1284,13 @@ class HistoryItem(BaseModel):
     created_at: str
     completed_at: Optional[str] = None
 
+
 class HistoryPage(BaseModel):
     items: List[HistoryItem]
     total: int
     page: int
     page_size: int
+
 
 class DashboardStats(BaseModel):
     total_archives: int
@@ -1045,42 +1303,169 @@ class DashboardStats(BaseModel):
     today_failed: int
     processing_count: int
 
+
 # ============== API: Dashboard ==============
 @app.get("/api/dashboard", response_model=DashboardStats)
 def get_dashboard():
     conn = get_db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM archive_history").fetchone()[0]
-        success = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='success'").fetchone()[0]
-        failed = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='failed'").fetchone()[0]
-        pending = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='pending'").fetchone()[0]
-        processing = conn.execute("SELECT COUNT(*) FROM archive_history WHERE status='processing'").fetchone()[0]
+        success = conn.execute(
+            "SELECT COUNT(*) FROM archive_history WHERE status='success'"
+        ).fetchone()[0]
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM archive_history WHERE status='failed'"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM archive_history WHERE status='pending'"
+        ).fetchone()[0]
+        processing = conn.execute(
+            "SELECT COUNT(*) FROM archive_history WHERE status='processing'"
+        ).fetchone()[0]
         dirs_count = conn.execute("SELECT COUNT(*) FROM watch_dirs").fetchone()[0]
         pwd_count = conn.execute("SELECT COUNT(*) FROM passwords").fetchone()[0]
         today = datetime.now().strftime("%Y-%m-%d")
         today_success = conn.execute(
-            "SELECT COUNT(*) FROM archive_history WHERE status='success' AND completed_at LIKE ?", (f"{today}%",)
+            "SELECT COUNT(*) FROM archive_history WHERE status='success' AND completed_at LIKE ?",
+            (f"{today}%",),
         ).fetchone()[0]
         today_failed = conn.execute(
-            "SELECT COUNT(*) FROM archive_history WHERE status='failed' AND completed_at LIKE ?", (f"{today}%",)
+            "SELECT COUNT(*) FROM archive_history WHERE status='failed' AND completed_at LIKE ?",
+            (f"{today}%",),
         ).fetchone()[0]
     finally:
         conn.close()
     return DashboardStats(
-        total_archives=total, success_count=success, failed_count=failed,
-        pending_count=pending, watch_dirs_count=dirs_count, passwords_count=pwd_count,
-        today_success=today_success, today_failed=today_failed, processing_count=processing
+        total_archives=total,
+        success_count=success,
+        failed_count=failed,
+        pending_count=pending,
+        watch_dirs_count=dirs_count,
+        passwords_count=pwd_count,
+        today_success=today_success,
+        today_failed=today_failed,
+        processing_count=processing,
     )
+
+
+@app.get("/api/dashboard/trends")
+def get_dashboard_trends():
+    conn = get_db()
+    try:
+        rows = conn.execute("""
+            SELECT date(completed_at) as day,
+                   SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed
+            FROM archive_history
+            WHERE completed_at >= date('now', '-6 days')
+            GROUP BY day
+            ORDER BY day
+        """).fetchall()
+    finally:
+        conn.close()
+    from datetime import timedelta
+
+    result = {}
+    for r in rows:
+        result[r[0]] = {"day": r[0], "success": r[1], "failed": r[2]}
+    trends = []
+    today = datetime.now().date()
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        ds = d.isoformat()
+        trends.append(result.get(ds, {"day": ds, "success": 0, "failed": 0}))
+    return trends
+
+
+@app.get("/api/dashboard/system-info")
+def get_system_info():
+    # 7-Zip version
+    sz_version = "unknown"
+    try:
+        r = subprocess.run(
+            [get_sevenzip_path()],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+        first_line = (r.stdout or r.stderr or "").strip().split("\n")[0]
+        sz_version = first_line.strip()
+    except Exception:
+        pass
+    # Python version
+    py_version = (
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
+    # Disk space: collect per-filesystem info for all active watch dirs + data dir
+    disks = []
+    seen_devices = set()
+    paths_to_check = [str(DATA_DIR)]
+    try:
+        conn = get_db()
+        try:
+            wd_rows = conn.execute("SELECT watch_path, output_path FROM watch_dirs WHERE enabled=1").fetchall()
+        finally:
+            conn.close()
+        for r in wd_rows:
+            if r[0] not in paths_to_check:
+                paths_to_check.append(r[0])
+            if r[1] not in paths_to_check:
+                paths_to_check.append(r[1])
+    except Exception:
+        pass
+    for p in paths_to_check:
+        try:
+            usage = shutil.disk_usage(p)
+            st = os.stat(p)
+            dev_key = st.st_dev
+            if dev_key in seen_devices:
+                continue
+            seen_devices.add(dev_key)
+            label = "本地" if p == str(DATA_DIR) else p.split("/")[2] if len(p.split("/")) > 2 else p
+            disks.append({
+                "path": p,
+                "label": label,
+                "free": usage.free,
+                "total": usage.total,
+                "used": usage.used,
+            })
+        except Exception:
+            pass
+    if not disks:
+        disks.append({"path": str(DATA_DIR), "label": "本地", "free": 0, "total": 0, "used": 0})
+    # Uptime
+    uptime_seconds = int(time.time() - START_TIME)
+    return {
+        "sevenzip_version": sz_version,
+        "python_version": py_version,
+        "disks": disks,
+        "uptime_seconds": uptime_seconds,
+    }
+
 
 # ============== API: Watch Dirs ==============
 @app.get("/api/watch-dirs", response_model=List[WatchDirOut])
 def list_watch_dirs():
     conn = get_db()
     try:
-        rows = conn.execute("SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs ORDER BY id DESC").fetchall()
+        rows = conn.execute(
+            "SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs ORDER BY id DESC"
+        ).fetchall()
     finally:
         conn.close()
-    return [WatchDirOut(id=r[0], watch_path=r[1], output_path=r[2], enabled=bool(r[3]), auto_delete=bool(r[4]), created_at=r[5]) for r in rows]
+    return [
+        WatchDirOut(
+            id=r[0],
+            watch_path=r[1],
+            output_path=r[2],
+            enabled=bool(r[3]),
+            auto_delete=bool(r[4]),
+            created_at=r[5],
+        )
+        for r in rows
+    ]
+
 
 @app.post("/api/watch-dirs", response_model=WatchDirOut)
 def create_watch_dir(data: WatchDirCreate):
@@ -1089,19 +1474,35 @@ def create_watch_dir(data: WatchDirCreate):
         try:
             conn.execute(
                 "INSERT INTO watch_dirs (watch_path,output_path,enabled,auto_delete) VALUES (?,?,?,?)",
-                (data.watch_path, data.output_path, 1 if data.enabled else 0, 1 if data.auto_delete else 0)
+                (
+                    data.watch_path,
+                    data.output_path,
+                    1 if data.enabled else 0,
+                    1 if data.auto_delete else 0,
+                ),
             )
             conn.commit()
-            row = conn.execute("SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs WHERE watch_path=?", (data.watch_path,)).fetchone()
+            row = conn.execute(
+                "SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs WHERE watch_path=?",
+                (data.watch_path,),
+            ).fetchone()
         except sqlite3.IntegrityError:
             conn.close()
             raise HTTPException(400, "监控目录已存在")
         finally:
             conn.close()
-    result = WatchDirOut(id=row[0], watch_path=row[1], output_path=row[2], enabled=bool(row[3]), auto_delete=bool(row[4]), created_at=row[5])
+    result = WatchDirOut(
+        id=row[0],
+        watch_path=row[1],
+        output_path=row[2],
+        enabled=bool(row[3]),
+        auto_delete=bool(row[4]),
+        created_at=row[5],
+    )
     if result.enabled:
         watcher.add_path(result.watch_path, result.id, result.output_path)
     return result
+
 
 @app.delete("/api/watch-dirs/{wid}")
 def delete_watch_dir(wid: int):
@@ -1115,14 +1516,19 @@ def delete_watch_dir(wid: int):
             conn.close()
     return {"ok": True}
 
+
 @app.put("/api/watch-dirs/{wid}/toggle")
 def toggle_watch_dir(wid: int, enabled: bool):
     with db_lock:
         conn = get_db()
         try:
-            conn.execute("UPDATE watch_dirs SET enabled=? WHERE id=?", (1 if enabled else 0, wid))
+            conn.execute(
+                "UPDATE watch_dirs SET enabled=? WHERE id=?", (1 if enabled else 0, wid)
+            )
             conn.commit()
-            row = conn.execute("SELECT watch_path, output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
+            row = conn.execute(
+                "SELECT watch_path, output_path FROM watch_dirs WHERE id=?", (wid,)
+            ).fetchone()
         finally:
             conn.close()
     if row:
@@ -1132,11 +1538,71 @@ def toggle_watch_dir(wid: int, enabled: bool):
             watcher.remove_path(wid)
     return {"ok": True}
 
+
+@app.put("/api/watch-dirs/{wid}")
+def update_watch_dir(wid: int, data: WatchDirUpdate):
+    with db_lock:
+        conn = get_db()
+        try:
+            existing = conn.execute(
+                "SELECT watch_path, output_path, auto_delete, enabled FROM watch_dirs WHERE id=?",
+                (wid,),
+            ).fetchone()
+            if not existing:
+                conn.close()
+                raise HTTPException(404, "目录不存在")
+            new_watch = data.watch_path if data.watch_path is not None else existing[0]
+            new_output = (
+                data.output_path if data.output_path is not None else existing[1]
+            )
+            new_auto_delete = (
+                1
+                if (
+                    data.auto_delete
+                    if data.auto_delete is not None
+                    else bool(existing[2])
+                )
+                else 0
+            )
+            if data.watch_path is not None and data.watch_path != existing[0]:
+                dup = conn.execute(
+                    "SELECT id FROM watch_dirs WHERE watch_path=? AND id!=?",
+                    (new_watch, wid),
+                ).fetchone()
+                if dup:
+                    conn.close()
+                    raise HTTPException(400, "监控路径已存在")
+            conn.execute(
+                "UPDATE watch_dirs SET watch_path=?, output_path=?, auto_delete=? WHERE id=?",
+                (new_watch, new_output, new_auto_delete, wid),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT id,watch_path,output_path,enabled,auto_delete,created_at FROM watch_dirs WHERE id=?",
+                (wid,),
+            ).fetchone()
+        finally:
+            conn.close()
+    if data.watch_path is not None and data.watch_path != existing[0] and existing[3]:
+        watcher.remove_path(wid)
+        watcher.add_path(new_watch, wid, new_output)
+    return WatchDirOut(
+        id=row[0],
+        watch_path=row[1],
+        output_path=row[2],
+        enabled=bool(row[3]),
+        auto_delete=bool(row[4]),
+        created_at=row[5],
+    )
+
+
 @app.get("/api/watch-dirs/{wid}/scan")
 def scan_watch_dir(wid: int):
     conn = get_db()
     try:
-        row = conn.execute("SELECT watch_path, output_path FROM watch_dirs WHERE id=?", (wid,)).fetchone()
+        row = conn.execute(
+            "SELECT watch_path, output_path FROM watch_dirs WHERE id=?", (wid,)
+        ).fetchone()
     finally:
         conn.close()
     if not row:
@@ -1147,7 +1613,9 @@ def scan_watch_dir(wid: int):
 
 # ============== API: History ==============
 @app.get("/api/history", response_model=HistoryPage)
-def list_history(status: str = "", search: str = "", page: int = 1, page_size: int = 20):
+def list_history(
+    status: str = "", search: str = "", page: int = 1, page_size: int = 20
+):
     offset = (page - 1) * page_size
     conn = get_db()
     try:
@@ -1159,16 +1627,32 @@ def list_history(status: str = "", search: str = "", page: int = 1, page_size: i
         if search:
             where += " AND original_path LIKE ?"
             params.append(f"%{search}%")
-        total = conn.execute(f"SELECT COUNT(*) FROM archive_history {where}", params).fetchone()[0]
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM archive_history {where}", params
+        ).fetchone()[0]
         rows = conn.execute(
             f"SELECT id,original_path,output_path,status,file_size,password_used,error_message,extracted_size,file_count,duration_seconds,created_at,completed_at FROM archive_history {where} ORDER BY id DESC LIMIT ? OFFSET ?",
-            params + [page_size, offset]
+            params + [page_size, offset],
         ).fetchall()
     finally:
         conn.close()
-    cols = ['id','original_path','output_path','status','file_size','password_used','error_message','extracted_size','file_count','duration_seconds','created_at','completed_at']
+    cols = [
+        "id",
+        "original_path",
+        "output_path",
+        "status",
+        "file_size",
+        "password_used",
+        "error_message",
+        "extracted_size",
+        "file_count",
+        "duration_seconds",
+        "created_at",
+        "completed_at",
+    ]
     items = [HistoryItem(**dict(zip(cols, r))) for r in rows]
     return HistoryPage(items=items, total=total, page=page, page_size=page_size)
+
 
 @app.delete("/api/history/clear")
 def clear_history():
@@ -1176,10 +1660,14 @@ def clear_history():
         conn = get_db()
         try:
             conn.execute("DELETE FROM archive_history")
+            conn.execute("DELETE FROM done_files")
+            conn.execute("DELETE FROM failed_permanent")
+            conn.execute("DELETE FROM pending_files")
             conn.commit()
         finally:
             conn.close()
     return {"ok": True}
+
 
 @app.delete("/api/history/{hid}")
 def delete_history(hid: int):
@@ -1192,11 +1680,14 @@ def delete_history(hid: int):
             conn.close()
     return {"ok": True}
 
+
 @app.post("/api/history/{hid}/retry")
 def retry_history(hid: int):
     conn = get_db()
     try:
-        row = conn.execute("SELECT original_path FROM archive_history WHERE id=?", (hid,)).fetchone()
+        row = conn.execute(
+            "SELECT original_path FROM archive_history WHERE id=?", (hid,)
+        ).fetchone()
     finally:
         conn.close()
     if not row:
@@ -1206,13 +1697,18 @@ def retry_history(hid: int):
         conn = get_db()
         try:
             conn.execute("DELETE FROM done_files WHERE file_path=?", (archive_path,))
-            conn.execute("DELETE FROM failed_permanent WHERE file_path=?", (archive_path,))
+            conn.execute(
+                "DELETE FROM failed_permanent WHERE file_path=?", (archive_path,)
+            )
             conn.execute("DELETE FROM pending_files WHERE file_path=?", (archive_path,))
-            conn.execute("UPDATE archive_history SET status='pending', all_passwords_failed=0 WHERE id=?", (hid,))
+            conn.execute(
+                "UPDATE archive_history SET status='pending', all_passwords_failed=0 WHERE id=?",
+                (hid,),
+            )
             conn.commit()
             wd = conn.execute(
                 "SELECT wd.id, wd.output_path FROM watch_dirs wd WHERE wd.enabled=1 AND ? LIKE wd.watch_path || '%' LIMIT 1",
-                (archive_path,)
+                (archive_path,),
             ).fetchone()
         finally:
             conn.close()
@@ -1223,15 +1719,118 @@ def retry_history(hid: int):
     queue_archive(archive_path, wid, output_path)
     return {"ok": True}
 
+
+@app.post("/api/history/retry-all-failed")
+def retry_all_failed():
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, original_path FROM archive_history WHERE status='failed'"
+        ).fetchall()
+    finally:
+        conn.close()
+    retried = 0
+    for row in rows:
+        hid, archive_path = row[0], row[1]
+        with db_lock:
+            conn2 = get_db()
+            try:
+                conn2.execute(
+                    "DELETE FROM done_files WHERE file_path=?", (archive_path,)
+                )
+                conn2.execute(
+                    "DELETE FROM failed_permanent WHERE file_path=?", (archive_path,)
+                )
+                conn2.execute(
+                    "DELETE FROM pending_files WHERE file_path=?", (archive_path,)
+                )
+                conn2.execute(
+                    "UPDATE archive_history SET status='pending', all_passwords_failed=0 WHERE id=?",
+                    (hid,),
+                )
+                conn2.commit()
+                wd = conn2.execute(
+                    "SELECT wd.id, wd.output_path FROM watch_dirs wd WHERE wd.enabled=1 AND ? LIKE wd.watch_path || '%' LIMIT 1",
+                    (archive_path,),
+                ).fetchone()
+            finally:
+                conn2.close()
+        wid = wd[0] if wd else 0
+        output_path = wd[1] if wd else str(BASE_DIR / "extracted")
+        with processing_lock:
+            processing_files.discard(archive_path)
+        queue_archive(archive_path, wid, output_path)
+        retried += 1
+    return {"ok": True, "retried": retried}
+
+
+@app.delete("/api/history/{hid}/output")
+def delete_history_output(hid: int):
+    with db_lock:
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT status, output_path FROM archive_history WHERE id=?", (hid,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "记录不存在")
+            if row[0] != "success":
+                raise HTTPException(400, "只能删除成功解压的输出文件")
+            output_path = row[1]
+        finally:
+            conn.close()
+    if output_path and Path(output_path).exists():
+        conn = get_db()
+        try:
+            dirs = conn.execute("SELECT output_path FROM watch_dirs").fetchall()
+        finally:
+            conn.close()
+        allowed = any(output_path.startswith(d[0]) for d in dirs if d[0])
+        if not allowed:
+            allowed = output_path.startswith(str(BASE_DIR / "extracted"))
+        if not allowed:
+            raise HTTPException(403, "路径不在允许的输出目录内")
+        try:
+            shutil.rmtree(output_path)
+            log_task(f"已删除解压输出: {output_path}", "info")
+        except Exception as e:
+            raise HTTPException(500, f"删除失败: {e}")
+    with db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                "UPDATE archive_history SET output_path=NULL, extracted_size=0, file_count=0 WHERE id=?",
+                (hid,),
+            )
+            orig = conn.execute(
+                "SELECT original_path FROM archive_history WHERE id=?", (hid,)
+            ).fetchone()
+            if orig:
+                conn.execute("DELETE FROM done_files WHERE file_path=?", (orig[0],))
+                conn.execute(
+                    "DELETE FROM failed_permanent WHERE file_path=?", (orig[0],)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    return {"ok": True}
+
+
 # ============== API: Passwords ==============
 @app.get("/api/passwords", response_model=List[PasswordOut])
 def list_passwords():
     conn = get_db()
     try:
-        rows = conn.execute("SELECT id,password,tag,hit_count,created_at FROM passwords ORDER BY hit_count DESC, id DESC").fetchall()
+        rows = conn.execute(
+            "SELECT id,password,tag,hit_count,created_at FROM passwords ORDER BY hit_count DESC, id DESC"
+        ).fetchall()
     finally:
         conn.close()
-    return [PasswordOut(id=r[0], password=r[1], tag=r[2], hit_count=r[3], created_at=r[4]) for r in rows]
+    return [
+        PasswordOut(id=r[0], password=r[1], tag=r[2], hit_count=r[3], created_at=r[4])
+        for r in rows
+    ]
+
 
 @app.post("/api/passwords", response_model=PasswordOut)
 def create_password(data: PasswordCreate):
@@ -1239,14 +1838,23 @@ def create_password(data: PasswordCreate):
         conn = get_db()
         try:
             try:
-                conn.execute("INSERT INTO passwords (password,tag) VALUES (?,?)", (data.password, data.tag))
+                conn.execute(
+                    "INSERT INTO passwords (password,tag) VALUES (?,?)",
+                    (data.password, data.tag),
+                )
                 conn.commit()
             except sqlite3.IntegrityError:
                 raise HTTPException(400, "密码已存在")
-            row = conn.execute("SELECT id,password,tag,hit_count,created_at FROM passwords WHERE password=?", (data.password,)).fetchone()
+            row = conn.execute(
+                "SELECT id,password,tag,hit_count,created_at FROM passwords WHERE password=?",
+                (data.password,),
+            ).fetchone()
         finally:
             conn.close()
-    return PasswordOut(id=row[0], password=row[1], tag=row[2], hit_count=row[3], created_at=row[4])
+    return PasswordOut(
+        id=row[0], password=row[1], tag=row[2], hit_count=row[3], created_at=row[4]
+    )
+
 
 @app.delete("/api/passwords/{pid}")
 def delete_password(pid: int):
@@ -1259,6 +1867,7 @@ def delete_password(pid: int):
             conn.close()
     return {"ok": True}
 
+
 # ============== API: Settings ==============
 @app.get("/api/settings")
 def get_settings():
@@ -1269,13 +1878,17 @@ def get_settings():
         conn.close()
     return {r[0]: r[1] for r in rows}
 
+
 @app.put("/api/settings")
 def update_settings(data: dict):
     with db_lock:
         conn = get_db()
         try:
             for k, v in data.items():
-                conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (k, str(v)))
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",
+                    (k, str(v)),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -1284,18 +1897,29 @@ def update_settings(data: dict):
         get_semaphore(refresh=True)
     return {"ok": True}
 
+
 # ============== API: Logs ==============
 @app.get("/api/logs", response_model=List[LogOut])
 def get_logs(limit: int = 200, level: str = ""):
     conn = get_db()
     try:
         if level:
-            rows = conn.execute("SELECT id,level,message,task_id,created_at FROM task_logs WHERE level=? ORDER BY id DESC LIMIT ?", (level, limit)).fetchall()
+            rows = conn.execute(
+                "SELECT id,level,message,task_id,created_at FROM task_logs WHERE level=? ORDER BY id DESC LIMIT ?",
+                (level, limit),
+            ).fetchall()
         else:
-            rows = conn.execute("SELECT id,level,message,task_id,created_at FROM task_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                "SELECT id,level,message,task_id,created_at FROM task_logs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
     finally:
         conn.close()
-    return [LogOut(id=r[0], level=r[1], message=r[2], task_id=r[3] or "", created_at=r[4]) for r in rows]
+    return [
+        LogOut(id=r[0], level=r[1], message=r[2], task_id=r[3] or "", created_at=r[4])
+        for r in rows
+    ]
+
 
 @app.delete("/api/logs")
 def clear_logs():
@@ -1308,6 +1932,7 @@ def clear_logs():
             conn.close()
     return {"ok": True}
 
+
 # ============== API: Files ==============
 @app.get("/api/files")
 def list_files(path: str = "/tmp"):
@@ -1319,19 +1944,28 @@ def list_files(path: str = "/tmp"):
         for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
             try:
                 stat = item.stat()
-                items.append({
-                    "name": item.name,
-                    "path": str(item),
-                    "size": stat.st_size if item.is_file() else 0,
-                    "is_dir": item.is_dir(),
-                    "is_archive": item.is_file() and is_archive(str(item)),
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                })
+                items.append(
+                    {
+                        "name": item.name,
+                        "path": str(item),
+                        "size": stat.st_size if item.is_file() else 0,
+                        "is_dir": item.is_dir(),
+                        "is_archive": item.is_file() and is_archive(str(item)),
+                        "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    }
+                )
             except:
                 pass
     except PermissionError:
         raise HTTPException(403, "没有权限访问该目录")
-    return {"path": str(p), "parent": str(p.parent) if str(p) != "/" else None, "items": items}
+    return {
+        "path": str(p),
+        "parent": str(p.parent) if str(p) != "/" else None,
+        "items": items,
+    }
+
 
 # ============== WebSocket: Logs ==============
 @app.websocket("/ws/logs")
@@ -1344,11 +1978,18 @@ async def ws_logs(websocket: WebSocket):
     # Send last 50 logs on connect
     conn = get_db()
     try:
-        rows = conn.execute("SELECT level,message,created_at FROM task_logs ORDER BY id DESC LIMIT 50").fetchall()
+        rows = conn.execute(
+            "SELECT level,message,created_at FROM task_logs ORDER BY id DESC LIMIT 50"
+        ).fetchall()
     finally:
         conn.close()
     try:
-        await websocket.send_json([{"level": r[0], "message": r[1], "created_at": r[2]} for r in reversed(rows)])
+        await websocket.send_json(
+            [
+                {"level": r[0], "message": r[1], "created_at": r[2]}
+                for r in reversed(rows)
+            ]
+        )
         while True:
             try:
                 item = await asyncio.wait_for(q.get(), timeout=30)
@@ -1365,13 +2006,18 @@ async def ws_logs(websocket: WebSocket):
             except ValueError:
                 pass
 
+
 # ============== Static Files ==============
 @app.get("/")
 def root():
-    for candidate in [BASE_DIR / "frontend" / "index.html", Path("/app/frontend/index.html")]:
+    for candidate in [
+        BASE_DIR / "frontend" / "index.html",
+        Path("/app/frontend/index.html"),
+    ]:
         if candidate.exists():
             return FileResponse(str(candidate))
     return {"message": "ArchiveMate v2 API running"}
+
 
 for assets_dir in [BASE_DIR / "frontend" / "assets", Path("/app/frontend/assets")]:
     if assets_dir.exists():
@@ -1380,4 +2026,5 @@ for assets_dir in [BASE_DIR / "frontend" / "assets", Path("/app/frontend/assets"
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=3088, log_level="info")

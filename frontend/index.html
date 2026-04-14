@@ -19,6 +19,38 @@
       --sidebar-text: #1e293b;
       --bg-image: none; --bg-blur: 0px;
     }
+    /* 深色主题 */
+    [data-theme="dark"] {
+      --bg: #0f172a; --sidebar: #1e293b; --card: rgba(30,41,59,0.92);
+      --border: rgba(99,102,241,0.2); --primary: #818cf8; --primary-h: #6366f1;
+      --success: #22c55e; --error: #ef4444; --warning: #f59e0b; --pending: #a78bfa;
+      --text: #f1f5f9; --muted: #cbd5e1; --dim: #64748b;
+      --sidebar-text: #f1f5f9;
+    }
+    [data-theme="dark"] .badge-success { background: rgba(34,197,94,0.15); }
+    [data-theme="dark"] .badge-error { background: rgba(239,68,68,0.15); }
+    [data-theme="dark"] .badge-warning { background: rgba(245,158,11,0.15); }
+    [data-theme="dark"] .badge-info { background: rgba(129,140,248,0.15); }
+    [data-theme="dark"] .input { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.12); color: #f1f5f9; }
+    [data-theme="dark"] .input:focus { border-color: #818cf8; box-shadow: 0 0 0 3px rgba(129,140,248,0.15); }
+    [data-theme="dark"] .btn-ghost { background: rgba(255,255,255,0.05); color: #cbd5e1; border-color: rgba(255,255,255,0.1); }
+    [data-theme="dark"] .btn-ghost:hover { background: rgba(255,255,255,0.1); }
+    [data-theme="dark"] .btn-danger { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.25); }
+    [data-theme="dark"] .modal { background: #1e293b; border-color: rgba(99,102,241,0.2); }
+    [data-theme="dark"] .table-wrap th { background: rgba(255,255,255,0.05); color: #64748b; }
+    [data-theme="dark"] .table-wrap td { color: #cbd5e1; border-bottom-color: rgba(255,255,255,0.05); }
+    [data-theme="dark"] .table-wrap tr:hover td { background: rgba(129,140,248,0.06); }
+    [data-theme="dark"] select.input option { background: #1e293b; color: #f1f5f9; }
+    [data-theme="dark"] .toast-success { background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.3); }
+    [data-theme="dark"] .toast-error { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.3); }
+    [data-theme="dark"] .toast-info { background: rgba(129,140,248,0.12); border-color: rgba(129,140,248,0.3); }
+    [data-theme="dark"] .stat-card.glow-blue { box-shadow: 0 2px 12px rgba(129,140,248,0.15); }
+    [data-theme="dark"] .stat-card.glow-green { box-shadow: 0 2px 12px rgba(34,197,94,0.12); }
+    [data-theme="dark"] .stat-card.glow-red { box-shadow: 0 2px 12px rgba(239,68,68,0.12); }
+    [data-theme="dark"] .stat-card.glow-purple { box-shadow: 0 2px 12px rgba(167,139,250,0.12); }
+    [data-theme="dark"] .log-entry { border-bottom-color: rgba(255,255,255,0.04); }
+    [data-theme="dark"] .nav-item:hover { background: rgba(129,140,248,0.1); }
+    [data-theme="dark"] .nav-item.active { background: rgba(129,140,248,0.15); }
     /* 自定义背景时启用 */
     body.has-bg { background-attachment: fixed; background-size: cover; background-position: center; }
     body.has-bg .sidebar { background: rgba(255,255,255,0.78); backdrop-filter: blur(16px); }
@@ -80,6 +112,7 @@
     .spinner { width: 14px; height: 14px; border: 2px solid rgba(99,102,241,0.2); border-top-color: #6366f1; border-radius: 50%; animation: spin .6s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
+  <script>if(localStorage.getItem('am_dark_mode')==='true')document.documentElement.dataset.theme='dark';</script>
 </head>
 <body>
 <div id="app" style="display:flex;min-height:100vh;">
@@ -104,6 +137,13 @@
       </div>
     </nav>
     <div style="padding:12px 16px 20px;border-top:1px solid var(--border);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <span style="font-size:12px;color:var(--muted);">{{ isDark ? '🌙' : '☀️' }} {{ isDark ? '深色' : '亮色' }}</span>
+        <div @click="toggleDark"
+          :style="{width:'40px',height:'22px',borderRadius:'11px',background:isDark?'#818cf8':'#e2e8f0',border:'1px solid rgba(99,102,241,0.3)',position:'relative',transition:'background .2s',cursor:'pointer'}">
+          <div :style="{position:'absolute',top:'2px',left:isDark?'20px':'2px',width:'16px',height:'16px',borderRadius:'50%',background:'white',transition:'left .2s'}"></div>
+        </div>
+      </div>
       <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);">
         <span style="width:7px;height:7px;border-radius:50%;background:#22c55e;animation:pulse 2s infinite;"></span>
         <span>服务运行中</span>
@@ -200,6 +240,52 @@
           <div v-if="!watchDirs.length" style="color:var(--dim);font-size:13px;">尚未添加监控目录</div>
         </div>
       </div>
+
+      <!-- System Info -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px;">
+        <div class="card" style="padding:14px 18px;">
+          <div style="font-size:11px;color:var(--dim);">🔧 7-Zip</div>
+          <div style="font-size:12px;color:var(--text);margin-top:4px;word-break:break-all;">{{ sysInfo.sevenzip_version || '-' }}</div>
+        </div>
+        <div class="card" style="padding:14px 18px;">
+          <div style="font-size:11px;color:var(--dim);">🐍 Python</div>
+          <div style="font-size:12px;color:var(--text);margin-top:4px;">{{ sysInfo.python_version || '-' }}</div>
+        </div>
+        <template v-for="(dk, di) in (sysInfo.disks || [{label:'本地',free:0,total:0,used:0}])" :key="di">
+          <div class="card" style="padding:14px 18px;">
+            <div style="font-size:11px;color:var(--dim);">💾 {{ dk.label }}</div>
+            <div style="font-size:12px;color:var(--text);margin-top:4px;">
+              {{ dk.total ? fmtSize(dk.free) + ' / ' + fmtSize(dk.total) : '-' }}
+            </div>
+            <div v-if="dk.total" style="height:4px;background:rgba(0,0,0,0.08);border-radius:2px;margin-top:6px;overflow:hidden;">
+              <div :style="{width:((dk.used/dk.total)*100)+'%',height:'100%',background:dk.used/dk.total>0.9?'#ef4444':'#22c55e',borderRadius:'2px'}"></div>
+            </div>
+          </div>
+        </template>
+        <div class="card" style="padding:14px 18px;">
+          <div style="font-size:11px;color:var(--dim);">⏱ 运行时间</div>
+          <div style="font-size:12px;color:var(--text);margin-top:4px;">{{ formatUptime(sysInfo.uptime_seconds) }}</div>
+        </div>
+      </div>
+
+      <!-- 7-Day Trends -->
+      <div class="card" style="padding:20px;margin-top:16px;" v-if="trends.length">
+        <div style="font-size:14px;font-weight:600;margin-bottom:16px;">📊 最近 7 天趋势</div>
+        <div style="display:flex;align-items:flex-end;gap:8px;height:120px;">
+          <div v-for="t in trends" :key="t.day" style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;">
+            <div style="display:flex;flex-direction:column;align-items:center;width:100%;height:100px;justify-content:flex-end;">
+              <div v-if="t.success" :style="{width:'100%',maxWidth:'32px',height:Math.max(t.success/trendsMax*80,4)+'px',background:'#22c55e',borderRadius:'3px 3px 0 0',transition:'height .3s'}"></div>
+              <div v-if="t.failed" :style="{width:'100%',maxWidth:'32px',height:Math.max(t.failed/trendsMax*80,4)+'px',background:'#ef4444',borderRadius:'0 0 3px 3px',transition:'height .3s'}"></div>
+            </div>
+            <div style="font-size:10px;color:var(--dim);margin-top:4px;">{{ t.day.slice(5) }}</div>
+            <div style="font-size:9px;color:var(--dim);">{{ t.success }}✓ {{ t.failed }}✗</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:16px;margin-top:10px;font-size:11px;color:var(--dim);">
+          <span><span style="display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:2px;vertical-align:middle;margin-right:3px;"></span> 成功</span>
+          <span><span style="display:inline-block;width:10px;height:10px;background:#ef4444;border-radius:2px;vertical-align:middle;margin-right:3px;"></span> 失败</span>
+        </div>
+      </div>
     </div>
 
     <!-- Watch Dirs -->
@@ -223,6 +309,7 @@
               <div style="font-size:11px;color:var(--dim);padding-left:16px;margin-top:4px;">创建于 {{ d.created_at ? d.created_at.slice(0,16) : '' }}</div>
             </div>
             <div style="display:flex;align-items:center;gap:10px;">
+              <button class="btn btn-ghost" style="font-size:12px;padding:5px 12px;" @click="openEditDir(d)">✏️ 编辑</button>
               <button class="btn btn-ghost" style="font-size:12px;padding:5px 12px;" @click="scanDir(d.id)" :disabled="scanningId===d.id">
                 <span v-if="scanningId===d.id" class="spinner"></span>
                 <span v-else>🔍</span> 扫描
@@ -251,6 +338,10 @@
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
         <div><h1 style="font-size:22px;font-weight:700;">解压历史</h1><p style="color:var(--dim);font-size:13px;margin-top:4px;">共 {{ historyTotal }} 条记录</p></div>
         <button class="btn btn-danger" @click="confirmClearHistory" style="font-size:12px;">🗑 清空历史</button>
+        <button class="btn btn-primary" @click="retryAllFailed" style="font-size:12px;" :disabled="retryingAll">
+          <span v-if="retryingAll" class="spinner"></span>
+          🔄 重试全部失败
+        </button>
       </div>
       <!-- Filters -->
       <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;">
@@ -275,6 +366,9 @@
                   <div style="color:var(--dim);">原始路径: <span style="color:#93c5fd;">{{ h.original_path }}</span></div>
                   <div v-if="h.output_path" style="color:var(--dim);margin-top:2px;">输出路径: <span style="color:#4ade80;">{{ h.output_path }}</span></div>
                   <div v-if="h.error_message" style="color:#fca5a5;margin-top:4px;word-break:break-all;">错误: {{ h.error_message }}</div>
+                  <div v-if="h.status==='success' && h.output_path" style="margin-top:6px;">
+                    <button class="btn btn-danger" style="font-size:11px;padding:3px 8px;" @click="deleteOutput(h.id)">🗑 删除解压文件</button>
+                  </div>
                 </div>
               </td>
               <td><span :class="['badge', statusBadge(h.status)]">{{ statusText(h.status) }}</span></td>
@@ -477,11 +571,20 @@
         </div>
       </div>
 
-      <div class="card" style="padding:20px;margin-bottom:20px;">
+      <div class="card" style="padding:20px;margin-bottom:16px;">
         <div style="font-size:14px;font-weight:600;color:var(--primary);margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:10px;">🔑 密码设置</div>
         <div>
           <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">全局密码字典（每行一个，会与自定义密码合并）</label>
           <textarea v-model="settings.password_dict" class="input" style="height:140px;resize:vertical;font-family:monospace;font-size:12px;"></textarea>
+        </div>
+      </div>
+
+      <div class="card" style="padding:20px;margin-bottom:16px;">
+        <div style="font-size:14px;font-weight:600;color:var(--primary);margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:10px;">📝 日志设置</div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">日志保留天数</label>
+          <input v-model="settings.log_retention_days" type="number" min="1" max="365" class="input" style="width:120px;">
+          <p style="font-size:11px;color:var(--dim);margin-top:4px;">超过保留期限的日志将自动清理</p>
         </div>
       </div>
 
@@ -545,6 +648,30 @@
     </div>
   </div>
 
+  <!-- Modal: Edit Watch Dir -->
+  <div v-if="showEditDirModal" class="modal-bg" @click.self="showEditDirModal=false">
+    <div class="modal">
+      <h2 style="font-size:16px;font-weight:700;margin-bottom:20px;">✏️ 编辑监控目录</h2>
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">监控路径</label>
+          <input v-model="editingDir.watch_path" class="input">
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px;">解压输出路径</label>
+          <input v-model="editingDir.output_path" class="input">
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--muted);">
+          <input type="checkbox" v-model="editingDir.auto_delete"> 解压后自动删除原压缩包
+        </label>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px;">
+        <button class="btn btn-ghost" @click="showEditDirModal=false">取消</button>
+        <button class="btn btn-primary" @click="saveEditDir" :disabled="!editingDir.watch_path||!editingDir.output_path">保存</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast -->
   <div class="toast-container">
     <div v-for="t in toasts" :key="t.id" :class="['toast','toast-'+t.type]">
@@ -597,6 +724,17 @@ createApp({
     const bulkPwds = ref('');
     const scanningId = ref(null);
     const settingSaving = ref(false);
+    const isDark = ref(localStorage.getItem('am_dark_mode') === 'true');
+    const retryingAll = ref(false);
+    const showEditDirModal = ref(false);
+    const editingDir = ref({ id: 0, watch_path: '', output_path: '', auto_delete: false });
+    const sysInfo = ref({});
+    const trends = ref([]);
+    function toggleDark() {
+      isDark.value = !isDark.value;
+      document.documentElement.dataset.theme = isDark.value ? 'dark' : '';
+      localStorage.setItem('am_dark_mode', isDark.value ? 'true' : 'false');
+    }
 
     // 背景图
     const bgPreview = ref(localStorage.getItem('am_bg_preview') || '');
@@ -707,6 +845,7 @@ createApp({
     });
     const historyTotalPages = computed(() => Math.max(1, Math.ceil(historyTotal.value / historyPageSize)));
     const maxHitCount = computed(() => passwords.value.length ? Math.max(...passwords.value.map(p => p.hit_count)) : 0);
+    const trendsMax = computed(() => Math.max(...trends.value.map(t => Math.max(t.success, t.failed)), 1));
 
     function toast(message, type='info') {
       const id = Date.now();
@@ -729,12 +868,16 @@ createApp({
 
     async function loadDashboard() {
       try {
-        const [d, h] = await Promise.all([
+        const [d, h, si, tr] = await Promise.all([
           api.get('/api/dashboard'),
-          api.get('/api/history?page=1&page_size=10')
+          api.get('/api/history?page=1&page_size=10'),
+          api.get('/api/dashboard/system-info').catch(() => ({data:{}})),
+          api.get('/api/dashboard/trends').catch(() => ({data:[]})),
         ]);
         stats.value = d.data;
-        recentHistory.value = d.data.items || h.data.items || [];
+        recentHistory.value = h.data.items || [];
+        sysInfo.value = si.data;
+        trends.value = tr.data || [];
       } catch(e) {}
     }
 
@@ -847,6 +990,53 @@ createApp({
       } catch(e) { toast('清空失败', 'error'); }
     }
 
+    async function retryAllFailed() {
+      if (!confirm('确认重试所有失败的任务？')) return;
+      retryingAll.value = true;
+      try {
+        const r = await api.post('/api/history/retry-all-failed');
+        toast(`已重新加入队列: ${r.data.retried} 个任务`, 'success');
+        setTimeout(() => loadHistory(), 1500);
+      } catch(e) { toast('批量重试失败', 'error'); }
+      finally { retryingAll.value = false; }
+    }
+
+    function openEditDir(d) {
+      editingDir.value = { id: d.id, watch_path: d.watch_path, output_path: d.output_path, auto_delete: d.auto_delete };
+      showEditDirModal.value = true;
+    }
+    async function saveEditDir() {
+      try {
+        await api.put('/api/watch-dirs/' + editingDir.value.id, {
+          watch_path: editingDir.value.watch_path,
+          output_path: editingDir.value.output_path,
+          auto_delete: editingDir.value.auto_delete
+        });
+        showEditDirModal.value = false;
+        await loadWatchDirs();
+        toast('监控目录已更新', 'success');
+      } catch(e) { toast(e.response?.data?.detail || '更新失败', 'error'); }
+    }
+
+    async function deleteOutput(id) {
+      if (!confirm('确认删除解压输出文件？此操作不可恢复。')) return;
+      try {
+        await api.delete('/api/history/' + id + '/output');
+        toast('解压文件已删除', 'success');
+        await loadHistory();
+      } catch(e) { toast(e.response?.data?.detail || '删除失败', 'error'); }
+    }
+
+    function formatUptime(seconds) {
+      if (!seconds) return '-';
+      const d = Math.floor(seconds / 86400);
+      const h = Math.floor((seconds % 86400) / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      if (d > 0) return `${d}天 ${h}小时`;
+      if (h > 0) return `${h}小时 ${m}分`;
+      return `${m}分钟`;
+    }
+
     async function addPassword() {
       if (!newPwd.value.password) return;
       try {
@@ -933,6 +1123,10 @@ createApp({
     }
 
     onMounted(async () => {
+      if (localStorage.getItem('am_dark_mode') === 'true') {
+        isDark.value = true;
+        document.documentElement.dataset.theme = 'dark';
+      }
       await Promise.all([loadDashboard(), loadWatchDirs(), loadPasswords(), loadSettings()]);
       await loadHistory(1);
       await loadLogs();
@@ -962,12 +1156,14 @@ createApp({
       displayedLogs, logFilter, logAutoScroll, logContainer,
       fileData, fileLoading, quickJumpDir, fileBreadcrumb,
       toasts, showDirModal, newDir, newPwd, bulkPwds,
-      scanningId, settingSaving,
-      successRate, historyTotalPages, maxHitCount,
-      fmtSize, statusBadge, statusText,
+      scanningId, settingSaving, isDark, toggleDark,
+      retryingAll, showEditDirModal, editingDir, sysInfo, trends,
+      successRate, historyTotalPages, maxHitCount, trendsMax,
+      fmtSize, statusBadge, statusText, formatUptime,
       loadDashboard, loadHistory, loadLogs,
-      addDir, deleteDir, toggleDir, scanDir,
-      retryHistory, deleteHistoryItem, confirmClearHistory,
+      addDir, deleteDir, toggleDir, scanDir, openEditDir, saveEditDir,
+      retryHistory, deleteHistoryItem, confirmClearHistory, retryAllFailed,
+      deleteOutput,
       addPassword, deletePassword, importPasswords,
       saveSettings, browseDir, clearLogsDisplay, debounceHistory, toggleHistoryDetail,
       bgPreview, bgTextMode, onBgUpload, clearBg, applyBgTextMode,
